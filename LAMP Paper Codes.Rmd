@@ -1,0 +1,1981 @@
+---
+title: "LAMP"
+author: "Qingzhi Liu"
+date: "2024-09-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(tableone)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+library(beeswarm)
+library(tidyr)
+library(pheatmap)
+library(lme4)
+library(lmerTest)
+library(forestplot)
+library(readxl)
+library(stringr)
+library(psych)
+library(tidyverse)
+library(table1)
+library(patchwork)
+library(ComplexUpset)
+library(colorBlindness)
+library(finalfit)
+```
+
+#### Read Data
+```{r}
+mood_data = fread("Prechter_mood_measures_2dec222.csv")
+Prechter_Med = read.csv(file = "Prechter_RX_2dec22.csv")
+Prechter_Demo = fread("Prechter_demographics_2dec22_sub.csv")
+disease_data = fread("PrechterComorbidities_5dec22.csv")
+disease_type = disease_data %>% filter(variable == "be_dsmiv")
+comorbidity_data = read.csv(file = "diseasewide.csv")
+sort(table(disease_type$value), decreasing = TRUE)
+bipolar1_id = disease_type$record_id[which(disease_type$value == "Bipolar 1 (296.70A)")]
+bipolar2_id = disease_type$record_id[which(disease_type$value == "Bipolar 2 with Recurrent Depression (296.89R)")]
+control_id = disease_type$record_id[which(disease_type$value == "Healthy/Control (V71.09)")]
+depression_id = disease_type$record_id[which(disease_type$value == "Major Depression Recurrent (296.30)")]
+schizoaffective_id = disease_type$record_id[which(disease_type$value == "Schizoaffective Bipolar (295.70M)")]
+bipolarNOS_id = disease_type$record_id[which(disease_type$value == "Bipolar NOS (296.80)")]
+bipolar_id = c(bipolar1_id, bipolar2_id)
+```
+```{r}
+comorbidity_data <- comorbidity_data %>%
+  mutate(be_alcohol = case_when(
+    be_alcohol %in% c("Abuse (305.00)", "Dependence (303.90)") ~ "Yes",
+    is.na(be_alcohol) ~ "No",
+    TRUE ~ be_alcohol
+  )) %>% 
+  mutate(be_cannabis = case_when(
+    be_cannabis %in% c("Abuse (305.20)", "Dependence (304.30)") ~ "Yes",
+    is.na(be_cannabis) ~ "No",
+    TRUE ~ be_cannabis
+  )) %>% 
+  mutate(be_cocaine = case_when(
+    be_cocaine %in% c("Abuse (305.60)", "Dependence (304.20)") ~ "Yes",
+    is.na(be_cocaine) ~ "No",
+    TRUE ~ be_cocaine
+  ))
+comorbidity_data[, 28:72] = as.data.frame(lapply(comorbidity_data[, 28:72], function(x) replace(x, x == "Unknown", NA)))
+
+comorbidity_data = comorbidity_data[,c("record_id", "be_dsmiv", "measure_age", "be_alcohol", "be_cannabis", "be_cocaine",  "be_specificphobia", "be_ptsd", "digs_head_injury", "digs_migraine", "digs_overweight")]
+```
+
+#### Data Preprocessing Function ####
+```{r}
+RXCUI_ATC_Mapping = read_excel("PrechterCohort_RxCUIs_Mapped_to_ATC_N_modified_curated_20230912_LF.xlsx")
+RXCUI_ATC_N_Mapping = RXCUI_ATC_Mapping %>% filter(substr(ATC, 1, 1) == "N") %>% distinct() 
+RXCUI_ATC_N_Level1_Mapping = RXCUI_ATC_N_Mapping %>% filter(ATC_Level == 1)
+
+RXCUI_ATC_N_Level3_Mapping = RXCUI_ATC_N_Mapping %>% filter(ATC_Level == 3) %>%
+   mutate(ATC_Name = ifelse(str_detect(tolower(RxNorm_Name), "lithium"), "LITHIUM SALTS", ATC_Name)) %>%
+   mutate(ATC = ifelse(str_detect(tolower(RxNorm_Name), "lithium"), "N05Z", ATC))
+all_CUIs <- data.frame(
+ RxCUI = unique(as.numeric(Prechter_Med$RxCUID))
+)
+RXCUI_ATC_N_Level3_Mapping_All <- full_join(RXCUI_ATC_N_Level3_Mapping, all_CUIs, by = "RxCUI")
+
+RXCUI_ATC_N_Level4_Mapping = RXCUI_ATC_N_Mapping %>% filter(ATC_Level == 4)
+all_CUIs <- data.frame(
+ RxCUI = unique(as.numeric(Prechter_Med$RxCUID))
+)
+RXCUI_ATC_N_Level4_Mapping_All <- full_join(RXCUI_ATC_N_Level4_Mapping, all_CUIs, by = "RxCUI")
+
+
+#RXCUI_ATC_N_Level3_Mapping[is.na(RXCUI_ATC_N_Level3_Mapping)] <- "Unknown"
+
+RXCUI_ATC_N_Level5_Mapping = RXCUI_ATC_N_Mapping %>% filter(ATC_Level == 5)
+# Remove trailing ";"  "," " and" if present
+RXCUI_ATC_N_Level5_Mapping$ATC_Name <- str_extract(RXCUI_ATC_N_Level5_Mapping$ATC_Name, "^[^,;]*(?:[,;]| and|$)")
+RXCUI_ATC_N_Level5_Mapping$ATC_Name <- sub("[,;]+$", "", RXCUI_ATC_N_Level5_Mapping$ATC_Name)
+RXCUI_ATC_N_Level5_Mapping$ATC_Name <- str_remove(RXCUI_ATC_N_Level5_Mapping$ATC_Name, " and.*")
+colnames(RXCUI_ATC_N_Level5_Mapping)[5:6] = c("ATC_Level5", "ATC_Level5_Name") 
+RXCUI_ATC_N_Level5_Mapping = RXCUI_ATC_N_Level5_Mapping[,-7]
+lookup_table_level3 <- RXCUI_ATC_N_Level3_Mapping %>%
+  select(ATC, ATC_Name) %>% rename(ATC_Level3 = ATC) %>%  rename(ATC_Level3_Name = ATC_Name) %>% distinct() 
+lookup_table_level4 <- RXCUI_ATC_N_Level4_Mapping %>%
+  select(ATC, ATC_Name) %>% rename(ATC_Level4 = ATC) %>%  rename(ATC_Level4_Name = ATC_Name) %>% distinct() 
+RXCUI_ATC_N_Level5_Mapping <- RXCUI_ATC_N_Level5_Mapping %>%
+  mutate(ATC_Level3 = substr(ATC_Level5, 1, 4)) %>%
+  left_join(lookup_table_level3, by = c("ATC_Level3")) %>% distinct(RxCUI, ATC_Level5_Name, ATC_Level3, .keep_all = TRUE) %>%
+  mutate(ATC_Level3 = ifelse(ATC_Level5_Name == "lithium", "N05Z", ATC_Level3)) %>%
+  mutate(ATC_Level3_Name = ifelse(ATC_Level5_Name == "lithium", "LITHIUM SALTS", ATC_Level3_Name))  %>%
+  mutate(ATC_Level4 = substr(ATC_Level5, 1, 5)) %>%
+  left_join(lookup_table_level4, by = c("ATC_Level4")) %>% distinct(RxCUI, ATC_Level5_Name, ATC_Level3, ATC_Level4, .keep_all = TRUE)
+  
+RXCUI_ATC_N_Level5_Mapping_All <- full_join(RXCUI_ATC_N_Level5_Mapping, all_CUIs, by = "RxCUI")
+
+
+length(unique(RXCUI_ATC_N_Level3_Mapping$ATC_Name))
+length(unique(RXCUI_ATC_N_Level4_Mapping$ATC_Name))
+length(unique(RXCUI_ATC_N_Level5_Mapping$ATC_Level5_Name))
+length(unique(RXCUI_ATC_N_Level5_Mapping$ATC_Level3_Name))
+
+ATC_Level3_Level4_Mapping = RXCUI_ATC_N_Level5_Mapping %>% select(ATC_Level4_Name, ATC_Level3_Name) %>% distinct()
+kable(sort(table(ATC_Level3_Level4_Mapping$ATC_Level3_Name), decreasing = TRUE))
+
+ATC_Level3_Level5_Mapping = RXCUI_ATC_N_Level5_Mapping %>% select(ATC_Level5_Name, ATC_Level3_Name) %>% distinct()
+kable(sort(table(ATC_Level3_Level5_Mapping$ATC_Level3_Name), decreasing = TRUE))
+```
+
+
+```{r}
+read_data2 = function(data = mood_data, id = bipolar1_id, score_name = "phq_score") {
+  Prechter_Med_filter = Prechter_Med[Prechter_Med$record_id %in% id, ] %>% 
+    mutate(RxCUID = as.numeric(RxCUID)) %>% filter(!is.na(RxCUID)) %>% rename(RxCUI = RxCUID)
+  med_data = inner_join(Prechter_Med_filter, RXCUI_ATC_N_Level5_Mapping_All, by = c("RxCUI"))
+  #med_data_level4 = inner_join(Prechter_Med_filter, RXCUI_ATC_N_Level4_Mapping, by = c("Drug_RxCUI")) %>% 
+  #  group_by(record_id, phy_quest_interval)
+  #med_data_level5 = inner_join(Prechter_Med_filter, RXCUI_ATC_N_Level5_Mapping, by = c("Drug_RxCUI")) %>% 
+  #  group_by(record_id, phy_quest_interval)
+  #med_data = cbind(med_data_level2[,c(-18,-19)], med_data_level3[16:17], med_data_level4[16:17], med_data_level5[16:17])
+  #colnames(med_data)[16:23] = c("ATC_Level2_Code", "ATC_Level2_Name", "ATC_Level3_Code", "ATC_Level3_Name", "ATC_Level4_Code", "ATC_Level4_Name","ATC_Level5_Code", "ATC_Level5_Name")
+  
+  med_data = med_data %>% mutate(phy_quest_interval = as.Date(phy_quest_interval)) %>%rename(date = phy_quest_interval)
+  first_med_date <- med_data %>% group_by(record_id) %>% summarise(first_med_date = min(date, na.rm = TRUE)) %>% ungroup()
+  last_med_date <- med_data %>% group_by(record_id) %>% summarise(last_med_date = max(date, na.rm = TRUE)) %>% ungroup()
+
+    
+
+  # Mood
+  med_id = as.character(unique(med_data$record_id))
+  mood_data = data %>% filter(record_id %in% med_id) %>%
+    filter(variable == score_name) %>% mutate(value = suppressWarnings(as.numeric(value)), timestamp = as.Date(timestamp)) %>% group_by(record_id, timestamp) %>% 
+    distinct(timestamp, .keep_all = TRUE) %>% ungroup() %>%
+    dplyr::select(record_id, measure_age, timestamp, value) %>% filter(complete.cases(.)) %>% 
+    left_join(first_med_date, by = "record_id") %>% 
+    left_join(last_med_date, by = "record_id") %>% 
+    filter(timestamp >= first_med_date & timestamp <= (last_med_date+365)) %>% group_by(record_id) %>% filter(n() >= 3) %>% ungroup() %>% rename(date = timestamp)
+  
+  first_mood_date <- mood_data %>% group_by(record_id) %>% summarise(first_mood_date = min(date, na.rm = TRUE)) %>% ungroup()
+  last_mood_date <- mood_data %>% group_by(record_id) %>% summarise(last_mood_date = max(date, na.rm = TRUE)) %>% ungroup()
+
+  med_data = med_data %>% 
+    left_join(first_mood_date, by = "record_id") %>% 
+    left_join(last_mood_date, by = "record_id") %>% 
+    filter(date >= first_mood_date-365 & date <= (last_mood_date)) %>% 
+    group_by(record_id, redcap_event_name) %>% 
+    mutate(Antiepileptics_temp = ifelse("ANTIEPILEPTICS" %in% ATC_Level3_Name, 1, 0)/length(redcap_event_name), 
+           Antipsychotics_temp = ifelse("ANTIPSYCHOTICS" %in% ATC_Level3_Name, 1, 0)/length(redcap_event_name), 
+           Antidepressants_temp = ifelse("ANTIDEPRESSANTS" %in% ATC_Level3_Name, 1, 0)/length(redcap_event_name), Anxiolytics_temp = ifelse("ANXIOLYTICS" %in% ATC_Level3_Name, 1, 0)/length(redcap_event_name), Lithium_temp = ifelse("LITHIUM SALTS" %in% ATC_Level3_Name, 1, 0)/length(redcap_event_name)) %>% 
+    mutate(Mood_Stabilizer_temp = max(Antiepileptics_temp, Lithium_temp)) %>% 
+    ungroup() %>% group_by(record_id) %>%
+    mutate(Antiepileptics_Freq = sum(Antiepileptics_temp)/length(unique(redcap_event_name)),
+           Antipsychotics_Freq = sum(Antipsychotics_temp)/length(unique(redcap_event_name)),
+           Antidepressants_Freq = sum(Antidepressants_temp)/length(unique(redcap_event_name)),
+           Anxiolytics_Freq = sum(Anxiolytics_temp)/length(unique(redcap_event_name)), 
+           Lithium_Freq = sum(Lithium_temp)/length(unique(redcap_event_name)),
+           Mood_Stabilizer_Freq = sum(Mood_Stabilizer_temp)/length(unique(redcap_event_name))) %>% 
+    ungroup() %>% group_by(record_id, redcap_event_name) %>% mutate(Average_Med_temp = n()/length(redcap_event_name), Average_NervMed_temp = sum(!is.na(RxNorm_Name))/length(redcap_event_name)) %>% ungroup() %>% group_by(record_id) %>% mutate(Average_Med = sum(Average_Med_temp)/length(unique(redcap_event_name)), Average_NervMed = sum(Average_NervMed_temp)/length(unique(redcap_event_name)))
+  
+
+  
+  # Demo
+  mood_id = unique(med_data$record_id)
+  demo_data = Prechter_Demo %>% filter(record_id %in% mood_id) %>% 
+    dplyr::select(record_id, gender, baseline_marital_status) %>% 
+    mutate(baseline_marital_status = replace(
+      baseline_marital_status,
+      baseline_marital_status %in% c("Separated", "Widowed", "Divorced"),
+      "Divorced/Separated/Widowed"
+    )) %>% filter(baseline_marital_status != "") %>% filter(gender != "Other")
+  
+  # Merge
+  med_complete = med_data %>% 
+    filter(record_id %in% intersect(intersect(demo_data$record_id, med_data$record_id), mood_data$record_id))
+  mood_complete = mood_data %>% 
+    filter(record_id %in% intersect(intersect(demo_data$record_id, med_data$record_id), mood_data$record_id)) 
+  mood_demoData = inner_join(mood_complete, demo_data, by = c("record_id"))
+  mood_demoData = mood_demoData %>% group_by(record_id) %>% 
+    mutate(years_from_baseline = round(as.numeric((date - min(date,na.rm = TRUE)))/365,2))
+  
+  med_complete_distinct = med_complete %>% distinct(record_id, .keep_all = TRUE) %>% dplyr::select(record_id, Average_Med, Average_NervMed, Antiepileptics_Freq, Antipsychotics_Freq, Antidepressants_Freq, Anxiolytics_Freq, Lithium_Freq, Mood_Stabilizer_Freq)
+  mergeData = inner_join(mood_demoData, med_complete_distinct, by = c("record_id"))
+  
+  return(list(med_complete = med_complete, mood_demo_data = mood_demoData, mergeData = mergeData, med_complete_distinct= med_complete_distinct))
+}
+
+
+```
+
+
+#### BP LAMP #####
+```{r}
+BP_comorbidity = comorbidity_data %>% filter(be_dsmiv %in% c("Bipolar 1 (296.70A)", "Bipolar 2 with Recurrent Depression (296.89R)"))
+
+BP_PHQ_mergeData = read_data2(data = mood_data, id = bipolar_id, score_name = "phq_score")[[3]] %>% rename(PHQ = value)
+BP_GAD_mergeData = read_data2(data = mood_data, id = bipolar_id, score_name = "gad_score")[[3]] %>% rename(GAD = value)
+BP_ASRM_mergeData = read_data2(data = mood_data, id = bipolar_id, score_name = "asrm_score")[[3]] %>% rename(ASRM = value)
+
+bipolar1_df <- data.frame(record_id = bipolar1_id, disease_type = 'Bipolar 1')
+bipolar2_df <- data.frame(record_id = bipolar2_id, disease_type = 'Bipolar 2')
+disease_type <- rbind(bipolar1_df, bipolar2_df)
+BP_PHQ_mergeData <- left_join(BP_PHQ_mergeData, disease_type, by = 'record_id')
+BP_GAD_mergeData <- left_join(BP_GAD_mergeData, disease_type, by = 'record_id')
+BP_ASRM_mergeData <- left_join(BP_ASRM_mergeData, disease_type, by = 'record_id')
+
+# BP PHQ
+lmm_BP_PHQ_unadjust <- lmer(PHQ ~ years_from_baseline + (1 + years_from_baseline | record_id), data = BP_PHQ_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+temp = data.frame(record_id = unique(BP_PHQ_mergeData$record_id), Trajec_Intercept = coef(lmm_BP_PHQ_unadjust)$record_id[,1], Trajec_Slope = coef(lmm_BP_PHQ_unadjust)$record_id[,2])
+BP_PHQ_mergeData = inner_join(BP_PHQ_mergeData, temp, by =c("record_id"))
+BP_PHQ_mergeData_distinct <- BP_PHQ_mergeData[!duplicated(BP_PHQ_mergeData$record_id), ]
+
+summary_table <- summary(lm(Trajec_Slope  ~ Trajec_Intercept +  Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status, data = BP_PHQ_mergeData_distinct))$coefficients
+kable(summary_table, digits = 3, caption = "Regression Coefficients")
+summary(lm(Trajec_Slope  ~ Trajec_Intercept +  Antiepileptics_Freq + gender + baseline_marital_status, data = BP_PHQ_mergeData_distinct))$coefficients
+
+# BP GAD
+lmm_BP_GAD_unadjust <- lmer(GAD ~ years_from_baseline + (1 + years_from_baseline | record_id), data = BP_GAD_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+temp = data.frame(record_id = unique(BP_GAD_mergeData$record_id), Trajec_Intercept = coef(lmm_BP_GAD_unadjust)$record_id[,1], Trajec_Slope = coef(lmm_BP_GAD_unadjust)$record_id[,2])
+BP_GAD_mergeData = inner_join(BP_GAD_mergeData, temp, by =c("record_id"))
+BP_GAD_mergeData_distinct <- BP_GAD_mergeData[!duplicated(BP_GAD_mergeData$record_id), ]
+
+summary_table <- summary(lm(Trajec_Slope  ~ Trajec_Intercept +  Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status, data = BP_GAD_mergeData_distinct))$coefficients
+kable(summary_table, digits = 3, caption = "Regression Coefficients")
+
+# BP ASRM
+lmm_BP_ASRM_unadjust <- lmer(ASRM ~ years_from_baseline + (1 + years_from_baseline | record_id), data = BP_ASRM_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+temp = data.frame(record_id = unique(BP_ASRM_mergeData$record_id), Trajec_Intercept = coef(lmm_BP_ASRM_unadjust)$record_id[,1], Trajec_Slope = coef(lmm_BP_ASRM_unadjust)$record_id[,2])
+BP_ASRM_mergeData = inner_join(BP_ASRM_mergeData, temp, by =c("record_id"))
+BP_ASRM_mergeData_distinct <- BP_ASRM_mergeData[!duplicated(BP_ASRM_mergeData$record_id), ]
+summary(lm(Trajec_Slope  ~ Trajec_Intercept +  Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status, data = BP_ASRM_mergeData_distinct))
+
+summary_table <- summary(lm(Trajec_Slope  ~ Trajec_Intercept +  Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status, data = BP_ASRM_mergeData_distinct))$coefficients
+kable(summary_table, digits = 3, caption = "Regression Coefficients")
+```
+
+
+```{r}
+lmm_BP_PHQ_med <- lmer(PHQ ~ years_from_baseline + Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status +  (1 + years_from_baseline | record_id), data = BP_PHQ_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+kable(summary(lmm_BP_PHQ_med)$coefficients[,c(1,5)])
+
+lmm_BP_GAD_med <- lmer(GAD ~ years_from_baseline + Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status +  (1 + years_from_baseline | record_id), data = BP_GAD_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+kable(summary(lmm_BP_GAD_med)$coefficients[,c(1,5)])
+
+lmm_BP_ASRM_med <- lmer(ASRM ~ years_from_baseline + Antiepileptics_Freq + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Lithium_Freq + gender + baseline_marital_status +  (1 + years_from_baseline | record_id), data = BP_ASRM_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+kable(summary(lmm_BP_ASRM_med)$coefficients[,c(1,5)])
+```
+
+
+
+```{r}
+find_interval <- function(vec) {
+  sorted_vec <- sort(abs(vec))
+  target_length <- length(vec) / 2
+  cum_lengths <- cumsum(rep(1, length(vec)))
+  idx <- which.min(abs(cum_lengths - target_length))
+  return(sorted_vec[idx])
+}
+colnames(BP_PHQ_mergeData_distinct)[19:20] = c("PHQ_intercept", "PHQ_slope")
+PHQ_slope_cut <- find_interval(BP_PHQ_mergeData_distinct$PHQ_slope)
+BP_PHQ_mergeData_distinct$PHQ_slope_group = cut(BP_PHQ_mergeData_distinct$PHQ_slope, breaks = c(-Inf, -PHQ_slope_cut, PHQ_slope_cut, Inf), labels = c("Recovering", "Static", "Worsening"))
+BP_PHQ_mergeData_distinct$PHQ_intercept_group = cut(BP_PHQ_mergeData_distinct$PHQ_intercept, breaks = c(-Inf, 4.5, 9.5, 14.5, Inf), labels = c("Low", "Mild", "Moderate", "Severe"))
+
+colnames(BP_GAD_mergeData_distinct)[19:20] = c("GAD_intercept", "GAD_slope")
+GAD_slope_cut <- find_interval(BP_GAD_mergeData_distinct$GAD_slope)
+BP_GAD_mergeData_distinct$GAD_slope_group = cut(BP_GAD_mergeData_distinct$GAD_slope, breaks = c(-Inf, -GAD_slope_cut, GAD_slope_cut, Inf), labels = c("Recovering", "Static", "Worsening"))
+BP_GAD_mergeData_distinct$GAD_intercept_group = cut(BP_GAD_mergeData_distinct$GAD_intercept, breaks = c(-Inf, 4.5, 9.5, 14.5, Inf), labels = c("Minimal", "Mild", "Moderate", "Severe"))
+
+colnames(BP_ASRM_mergeData_distinct)[19:20] = c("ASRM_intercept", "ASRM_slope")
+ASRM_slope_cut <- find_interval(BP_ASRM_mergeData_distinct$ASRM_slope)
+BP_ASRM_mergeData_distinct$ASRM_slope_group = cut(BP_ASRM_mergeData_distinct$ASRM_slope, breaks = c(-Inf, -ASRM_slope_cut, ASRM_slope_cut, Inf), labels = c("Recovering", "Static", "Worsening"))
+BP_ASRM_mergeData_distinct$ASRM_intercept_group = cut(BP_ASRM_mergeData_distinct$ASRM_intercept, breaks = c(-Inf, 5.5, Inf), labels = c("Low", "High"))
+```
+
+```{r}
+# PHQ
+BP1_PHQ_mergeData2 <- merge(BP_PHQ_mergeData, BP_PHQ_mergeData_distinct[,c(1,21,22)], by = "record_id") %>% filter(disease_type == "Bipolar 1")
+ggplot(data= BP1_PHQ_mergeData2, aes(x= years_from_baseline, y= PHQ, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) + ylab("PHQ-9")  + xlab("Years")
+
+time_points <- 0:15
+BP1_PHQ_mergeData_distinct2 <- BP_PHQ_mergeData_distinct %>% filter(disease_type == "Bipolar 1") %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = PHQ_intercept + PHQ_slope * time)
+avg_data <- BP1_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+
+sample_size_data <- BP1_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group, time) %>%
+  summarise(N = n(), .groups = 'drop')
+avg_data <- left_join(avg_data, sample_size_data, by = c("PHQ_intercept_group", "PHQ_slope_group", "time"))
+
+avg_intercept_slope <- BP1_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group) %>%
+  summarise(avg_intercept = mean(PHQ_intercept),
+            avg_slope = mean(PHQ_slope) %>% round(2), .groups = 'drop')
+avg_data <- left_join(avg_data, avg_intercept_slope, by = c("PHQ_intercept_group", "PHQ_slope_group"))
+PHQ_BP1_avg_data = avg_data %>% filter(time == 0) %>%
+  arrange(factor(PHQ_intercept_group, levels = c("Severe", "Moderate", "Mild", "Low"))) %>%
+  select(-time,-avg_value) %>% rename(Intercept_Group = PHQ_intercept_group, Slope_Group = PHQ_slope_group, BP1_N = N, BP1_Avg_Intercept = avg_intercept, BP1_Avg_Slope = avg_slope) 
+
+ggplot(data= BP1_PHQ_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(PHQ_intercept_group, PHQ_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) +
+  ylab("PHQ-9") + 
+  xlab("Years") +
+  coord_cartesian(ylim = c(0, 35)) 
+
+
+BP2_PHQ_mergeData2 <- merge(BP_PHQ_mergeData, BP_PHQ_mergeData_distinct[,c(1,21,22)], by = "record_id") %>% filter(disease_type == "Bipolar 2")
+ggplot(data= BP2_PHQ_mergeData2, aes(x= years_from_baseline, y= PHQ, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) + ylab("PHQ-9")  + xlab("Years")
+
+time_points <- 0:15
+BP2_PHQ_mergeData_distinct2 <- BP_PHQ_mergeData_distinct %>% filter(disease_type == "Bipolar 2") %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = PHQ_intercept + PHQ_slope * time)
+avg_data <- BP2_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+
+sample_size_data <- BP2_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group, time) %>%
+  summarise(N = n(), .groups = 'drop')
+avg_data <- left_join(avg_data, sample_size_data, by = c("PHQ_intercept_group", "PHQ_slope_group", "time"))
+
+avg_intercept_slope <- BP2_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group) %>%
+  summarise(avg_intercept = mean(PHQ_intercept),
+            avg_slope = mean(PHQ_slope)%>% round(2), .groups = 'drop')
+avg_data <- left_join(avg_data, avg_intercept_slope, by = c("PHQ_intercept_group", "PHQ_slope_group"))
+PHQ_BP2_avg_data = avg_data %>% filter(time == 0) %>%
+  arrange(factor(PHQ_intercept_group, levels = c("Severe", "Moderate", "Mild", "Low"))) %>%
+  select(-time,-avg_value) %>% rename(Intercept_Group = PHQ_intercept_group, Slope_Group = PHQ_slope_group, BP2_N = N, BP2_Avg_Intercept = avg_intercept, BP2_Avg_Slope = avg_slope) 
+
+ggplot(data= BP2_PHQ_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(PHQ_intercept_group, PHQ_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) +
+  ylab("PHQ-9") + 
+  xlab("Years") +
+  coord_cartesian(ylim = c(0, 35)) 
+
+# GAD
+BP1_GAD_mergeData2 <- merge(BP_GAD_mergeData, BP_GAD_mergeData_distinct[,c(1,21,22)], by = "record_id") %>% filter(disease_type == "Bipolar 1")
+ggplot(data= BP1_GAD_mergeData2, aes(x= years_from_baseline, y= GAD, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) + ylab("GAD-7")  + xlab("Years")
+
+time_points <- 0:15
+BP1_GAD_mergeData_distinct2 <- BP_GAD_mergeData_distinct %>% filter(disease_type == "Bipolar 1") %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = GAD_intercept + GAD_slope * time)
+avg_data <- BP1_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+
+sample_size_data <- BP1_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group, time) %>%
+  summarise(N = n(), .groups = 'drop')
+avg_data <- left_join(avg_data, sample_size_data, by = c("GAD_intercept_group", "GAD_slope_group", "time"))
+
+avg_intercept_slope <- BP1_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group) %>%
+  summarise(avg_intercept = mean(GAD_intercept),
+            avg_slope = mean(GAD_slope)%>% round(2), .groups = 'drop')
+avg_data <- left_join(avg_data, avg_intercept_slope, by = c("GAD_intercept_group", "GAD_slope_group"))
+GAD_BP1_avg_data = avg_data %>% filter(time == 0) %>%
+  arrange(factor(GAD_intercept_group, levels = c("Severe", "Moderate", "Mild", "Minimal"))) %>%
+  select(-time,-avg_value) %>% rename(Intercept_Group = GAD_intercept_group, Slope_Group = GAD_slope_group, BP1_N = N, BP1_Avg_Intercept = avg_intercept, BP1_Avg_Slope = avg_slope) 
+
+
+ggplot(data= BP1_GAD_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(GAD_intercept_group, GAD_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) +
+  ylab("GAD-7") + 
+  xlab("Years") +
+  coord_cartesian(ylim = c(0, 35)) 
+
+
+BP2_GAD_mergeData2 <- merge(BP_GAD_mergeData, BP_GAD_mergeData_distinct[,c(1,21,22)], by = "record_id") %>% filter(disease_type == "Bipolar 2")
+ggplot(data= BP2_GAD_mergeData2, aes(x= years_from_baseline, y= GAD, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) + ylab("GAD-7")  + xlab("Years")
+
+time_points <- 0:15
+BP2_GAD_mergeData_distinct2 <- BP_GAD_mergeData_distinct %>% filter(disease_type == "Bipolar 2") %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = GAD_intercept + GAD_slope * time)
+avg_data <- BP2_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+
+sample_size_data <- BP2_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group, time) %>%
+  summarise(N = n(), .groups = 'drop')
+avg_data <- left_join(avg_data, sample_size_data, by = c("GAD_intercept_group", "GAD_slope_group", "time"))
+
+avg_intercept_slope <- BP2_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group) %>%
+  summarise(avg_intercept = mean(GAD_intercept),
+            avg_slope = mean(GAD_slope)%>% round(2), .groups = 'drop')
+avg_data <- left_join(avg_data, avg_intercept_slope, by = c("GAD_intercept_group", "GAD_slope_group"))
+GAD_BP2_avg_data = avg_data %>% filter(time == 0) %>%
+  arrange(factor(GAD_intercept_group, levels = c("Severe", "Moderate", "Mild", "Minimal"))) %>%
+  select(-time,-avg_value) %>% rename(Intercept_Group = GAD_intercept_group, Slope_Group = GAD_slope_group, BP2_N = N, BP2_Avg_Intercept = avg_intercept, BP2_Avg_Slope = avg_slope) 
+
+
+ggplot(data= BP2_GAD_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(GAD_intercept_group, GAD_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) +
+  ylab("GAD-7") + 
+  xlab("Years") +
+  coord_cartesian(ylim = c(0, 35)) 
+
+# ASRM
+BP1_ASRM_mergeData2 <- merge(BP_ASRM_mergeData, BP_ASRM_mergeData_distinct[,c(1,21,22)], by = "record_id") %>% filter(disease_type == "Bipolar 1")
+ggplot(data= BP1_ASRM_mergeData2, aes(x= years_from_baseline, y= ASRM, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High","Low"), ordered = TRUE) ~ ASRM_slope_group) + ylab("ASRM")  + xlab("Years")
+
+time_points <- 0:15
+BP1_ASRM_mergeData_distinct2 <- BP_ASRM_mergeData_distinct %>% filter(disease_type == "Bipolar 1") %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = ASRM_intercept + ASRM_slope * time)
+avg_data <- BP1_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+
+sample_size_data <- BP1_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group, time) %>%
+  summarise(N = n(), .groups = 'drop')
+avg_data <- left_join(avg_data, sample_size_data, by = c("ASRM_intercept_group", "ASRM_slope_group", "time"))
+
+avg_intercept_slope <- BP1_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group) %>%
+  summarise(avg_intercept = mean(ASRM_intercept),
+            avg_slope = mean(ASRM_slope)%>% round(2), .groups = 'drop')
+avg_data <- left_join(avg_data, avg_intercept_slope, by = c("ASRM_intercept_group", "ASRM_slope_group"))
+ASRM_BP1_avg_data = avg_data %>% filter(time == 0) %>%
+  arrange(factor(ASRM_intercept_group, levels = c("High", "Low"))) %>%
+  select(-time,-avg_value) %>% rename(Intercept_Group = ASRM_intercept_group, Slope_Group = ASRM_slope_group, BP1_N = N, BP1_Avg_Intercept = avg_intercept, BP1_Avg_Slope = avg_slope)
+
+
+ggplot(data= BP1_ASRM_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(ASRM_intercept_group, ASRM_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High","Low"), ordered = TRUE) ~ ASRM_slope_group) +
+  ylab("ASRM") + 
+  xlab("Years")
+
+
+BP2_ASRM_mergeData2 <- merge(BP_ASRM_mergeData, BP_ASRM_mergeData_distinct[,c(1,21,22)], by = "record_id") %>% filter(disease_type == "Bipolar 2")
+ggplot(data= BP2_ASRM_mergeData2, aes(x= years_from_baseline, y= ASRM, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High","Low"), ordered = TRUE) ~ ASRM_slope_group) + ylab("ASRM")  + xlab("Years")
+
+time_points <- 0:15
+BP2_ASRM_mergeData_distinct2 <- BP_ASRM_mergeData_distinct %>% filter(disease_type == "Bipolar 2") %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = ASRM_intercept + ASRM_slope * time)
+avg_data <- BP2_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+
+sample_size_data <- BP2_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group, time) %>%
+  summarise(N = n(), .groups = 'drop')
+avg_data <- left_join(avg_data, sample_size_data, by = c("ASRM_intercept_group", "ASRM_slope_group", "time"))
+
+avg_intercept_slope <- BP2_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group) %>%
+  summarise(avg_intercept = mean(ASRM_intercept),
+            avg_slope = mean(ASRM_slope)%>% round(2), .groups = 'drop')
+avg_data <- left_join(avg_data, avg_intercept_slope, by = c("ASRM_intercept_group", "ASRM_slope_group"))
+ASRM_BP2_avg_data = avg_data %>% filter(time == 0) %>%
+  arrange(factor(ASRM_intercept_group, levels = c("High", "Low"))) %>%
+  select(-time,-avg_value) %>% rename(Intercept_Group = ASRM_intercept_group, Slope_Group = ASRM_slope_group, BP2_N = N, BP2_Avg_Intercept = avg_intercept, BP2_Avg_Slope = avg_slope) 
+
+
+ggplot(data= BP2_ASRM_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(ASRM_intercept_group, ASRM_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High","Low"), ordered = TRUE) ~ ASRM_slope_group) +
+  ylab("ASRM") + 
+  xlab("Years")
+```
+
+```{r}
+# want to merge all the data together
+PHQ_BP_avg_data <- merge(PHQ_BP1_avg_data, PHQ_BP2_avg_data, by = c("Intercept_Group", "Slope_Group"), all = TRUE)%>% arrange(factor(Intercept_Group, levels = c("Low", "Mild", "Moderate", "Severe")))
+GAD_BP_avg_data <- merge(GAD_BP1_avg_data, GAD_BP2_avg_data, by = c("Intercept_Group", "Slope_Group"), all = TRUE)%>% arrange(factor(Intercept_Group, levels = c("Minimal", "Mild", "Moderate", "Severe")))
+ASRM_BP_avg_data <- merge(ASRM_BP1_avg_data, ASRM_BP2_avg_data, by = c("Intercept_Group", "Slope_Group"), all = TRUE)%>% arrange(factor(Intercept_Group, levels = c("Low", "High")))
+```
+
+```{r}
+BP_PHQ_mergeData_distinct$Score_Type = "PHQ"
+BP_GAD_mergeData_distinct$Score_Type = "GAD"
+BP_ASRM_mergeData_distinct$Score_Type = "ASRM"
+
+combined_data <- bind_rows(BP_PHQ_mergeData_distinct[,c(1,18,19,20,23)], BP_GAD_mergeData_distinct[,c(1,18,19,20,23)], BP_ASRM_mergeData_distinct[,c(1,18,19,20,23)])
+
+# Pivot longer for intercepts
+intercept_data <- combined_data %>%
+  select(disease_type, Score_Type, PHQ_intercept, GAD_intercept, ASRM_intercept) %>%
+  pivot_longer(cols = c(PHQ_intercept, GAD_intercept, ASRM_intercept), names_to = "Variable", values_to = "Value") %>%
+  mutate(Variable = sub("_intercept", "", Variable)) %>%
+  mutate(Score_Type = factor(Score_Type, levels = c("PHQ", "GAD", "ASRM")))  # Order the levels as desired
+
+# Plot for Intercepts
+ggplot(intercept_data, aes(x = Value, fill = disease_type)) +
+  geom_density(alpha = 0.5) +
+  facet_grid(Score_Type ~ ., scales = "free", space = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Estimated Intercepts by Disease Type", x = "Intercept", y = "Density",
+       fill = "Disease Type") +
+  scale_fill_brewer(palette = "Set1")
+
+# Pivot longer for slopes
+slope_data <- combined_data %>%
+  select(disease_type, Score_Type, PHQ_slope, GAD_slope, ASRM_slope) %>%
+  pivot_longer(cols = c(PHQ_slope, GAD_slope, ASRM_slope), names_to = "Variable", values_to = "Value") %>%
+  mutate(Variable = sub("_slope", "", Variable)) %>%
+  mutate(Score_Type = factor(Score_Type, levels = c("PHQ", "GAD", "ASRM")))  # Order the levels as desired
+
+# Plot for Slopes
+ggplot(slope_data, aes(x = Value, fill = disease_type)) +
+  geom_density(alpha = 0.5) +
+  facet_grid(Score_Type ~ ., scales = "free", space = "free") +
+  theme_minimal() +
+  labs(title = "Distribution of Estimated Slopes by Disease Type", x = "Slope", y = "Density",
+       fill = "Disease Type") +
+  scale_fill_brewer(palette = "Set1")
+```
+
+```{r}
+BP_PHQ_mergeData_distinct$Slope_Group = BP_PHQ_mergeData_distinct$PHQ_slope_group
+BP_GAD_mergeData_distinct$Slope_Group = BP_GAD_mergeData_distinct$GAD_slope_group
+BP_ASRM_mergeData_distinct$Slope_Group = BP_ASRM_mergeData_distinct$ASRM_slope_group
+BP_PHQ_mergeData_distinct$Intercept_Group = BP_PHQ_mergeData_distinct$PHQ_intercept_group
+BP_GAD_mergeData_distinct$Intercept_Group = BP_GAD_mergeData_distinct$GAD_intercept_group
+BP_ASRM_mergeData_distinct$Intercept_Group = BP_ASRM_mergeData_distinct$ASRM_intercept_group
+library(dplyr)
+
+# Transform PHQ_intercept_group
+BP_PHQ_mergeData_distinct <- BP_PHQ_mergeData_distinct %>%
+  mutate(PHQ_intercept_score = case_when(
+    PHQ_intercept_group == "Low" ~ 0,
+    PHQ_intercept_group == "Mild" ~ 1,
+    PHQ_intercept_group == "Moderate" ~ 2,
+    PHQ_intercept_group == "Severe" ~ 3,
+    TRUE ~ NA_integer_  # Handle any unexpected cases
+  ))
+# Transform GAD_intercept_group
+BP_GAD_mergeData_distinct <- BP_GAD_mergeData_distinct %>%
+  mutate(GAD_intercept_score = case_when(
+    GAD_intercept_group == "Minimal" ~ 0,
+    GAD_intercept_group == "Mild" ~ 1,
+    GAD_intercept_group == "Moderate" ~ 2,
+    GAD_intercept_group == "Severe" ~ 3,
+    TRUE ~ NA_integer_
+  ))
+# Transform ASRM_intercept_group
+BP_ASRM_mergeData_distinct <- BP_ASRM_mergeData_distinct %>%
+  mutate(ASRM_intercept_score = case_when(
+    ASRM_intercept_group == "Low" ~ 0,
+    ASRM_intercept_group == "High" ~ 2,
+    TRUE ~ NA_integer_
+  ))
+
+```
+
+```{r}
+BP_mergeData_distinct = rbind(BP_PHQ_mergeData_distinct, BP_GAD_mergeData_distinct, BP_ASRM_mergeData_distinct)
+BP_mergeData_distinct$PHQ_Recovering <- ifelse(BP_mergeData_distinct$Score_Type == "PHQ" & BP_mergeData_distinct$Slope_Group == "Recovering", 1, 0)
+BP_mergeData_distinct$PHQ_Worsening <- ifelse(BP_mergeData_distinct$Score_Type == "PHQ" & BP_mergeData_distinct$Slope_Group == "Worsening", 1, 0)
+BP_mergeData_distinct$PHQ_Static <- ifelse(BP_mergeData_distinct$Score_Type == "PHQ" & BP_mergeData_distinct$Slope_Group == "Static", 1, 0)
+BP_mergeData_distinct$GAD_Recovering <- ifelse(BP_mergeData_distinct$Score_Type == "GAD" & BP_mergeData_distinct$Slope_Group == "Recovering", 1, 0)
+BP_mergeData_distinct$GAD_Worsening <- ifelse(BP_mergeData_distinct$Score_Type == "GAD" & BP_mergeData_distinct$Slope_Group == "Worsening", 1, 0)
+BP_mergeData_distinct$GAD_Static <- ifelse(BP_mergeData_distinct$Score_Type == "GAD" & BP_mergeData_distinct$Slope_Group == "Static", 1, 0)
+BP_mergeData_distinct$ASRM_Recovering <- ifelse(BP_mergeData_distinct$Score_Type == "ASRM" & BP_mergeData_distinct$Slope_Group == "Recovering", 1, 0)
+BP_mergeData_distinct$ASRM_Worsening <- ifelse(BP_mergeData_distinct$Score_Type == "ASRM" & BP_mergeData_distinct$Slope_Group == "Worsening", 1, 0)
+BP_mergeData_distinct$ASRM_Static <- ifelse(BP_mergeData_distinct$Score_Type == "ASRM" & BP_mergeData_distinct$Slope_Group == "Static", 1, 0)
+
+BP_PHQ_mergeData_distinct <- left_join(BP_PHQ_mergeData_distinct, BP_comorbidity[,-3], by = "record_id")
+BP_GAD_mergeData_distinct <- left_join(BP_GAD_mergeData_distinct, BP_comorbidity[,-3], by = "record_id")
+BP_ASRM_mergeData_distinct <- left_join(BP_ASRM_mergeData_distinct, BP_comorbidity[,-3], by = "record_id")
+
+BP_severity_score <- BP_PHQ_mergeData_distinct %>%
+  select(record_id, PHQ_intercept_score) %>%
+  left_join(BP_GAD_mergeData_distinct %>% select(record_id, GAD_intercept_score), by = "record_id") %>%
+  left_join(BP_ASRM_mergeData_distinct %>% select(record_id, ASRM_intercept_score), by = "record_id")
+BP_severity_score_filtered <- BP_severity_score %>%
+  filter(!is.na(PHQ_intercept_score) & !is.na(GAD_intercept_score) & !is.na(ASRM_intercept_score))
+BP_severity_score_filtered <- BP_severity_score_filtered %>%
+  mutate(baseline_mood_severity_score = PHQ_intercept_score + GAD_intercept_score + ASRM_intercept_score)
+
+BP_severity_score_filtered <- BP_severity_score_filtered %>%
+  mutate(baseline_mood_severity_category = case_when(
+    baseline_mood_severity_score %in% 0:1 ~ "Low",
+    baseline_mood_severity_score %in% 2:8 ~ "Not Low"  ))  %>%
+  mutate(baseline_mood_severity_category = factor(baseline_mood_severity_category, levels = c("Low", "Not Low")))
+
+
+# Filter to include only patients with PHQ, GAD, and ASRM scores
+BP_mergeData_distinct_filtered <- BP_mergeData_distinct %>%
+  filter(Score_Type %in% c("PHQ", "GAD", "ASRM")) %>%
+  group_by(record_id) %>%
+  filter(all(c("PHQ", "GAD", "ASRM") %in% Score_Type)) %>%
+  ungroup()
+
+# Aggregate data for the UpSet plot
+upset_data_filtered <- BP_mergeData_distinct_filtered %>%
+  select(record_id, PHQ_Recovering, PHQ_Worsening, PHQ_Static, GAD_Recovering, GAD_Worsening, GAD_Static, ASRM_Recovering, ASRM_Worsening, ASRM_Static) %>%
+  group_by(record_id) %>%
+  summarise(across(everything(), max, na.rm = TRUE))
+
+# Add baseline mood severity score to the UpSet data
+upset_data_filtered_BP1 <- upset_data_filtered %>%
+  left_join(BP_severity_score_filtered %>% select(record_id, baseline_mood_severity_category), by = "record_id")  %>% filter(record_id %in% bipolar1_id)
+
+sets <- c("ASRM_Recovering", "GAD_Recovering", "PHQ_Recovering",
+          "ASRM_Static", "GAD_Static", "PHQ_Static",
+          "ASRM_Worsening", "GAD_Worsening", "PHQ_Worsening")
+# Rename the columns by switching order and replacing underscores
+upset_data_filtered_BP1 <- upset_data_filtered_BP1 %>%
+  rename_at(vars(sets), ~ gsub("(.*)_(.*)", "\\2 \\1", .))
+
+colnames(upset_data_filtered_BP1) <- gsub("PHQ", "PHQ-9", colnames(upset_data_filtered_BP1))
+colnames(upset_data_filtered_BP1) <- gsub("GAD", "GAD-7", colnames(upset_data_filtered_BP1))
+
+
+sets <- colnames(upset_data_filtered_BP1)[c(-1,-11)]
+
+ComplexUpset::upset(
+    upset_data_filtered_BP1,
+    sets,
+    base_annotations = list(
+        'Intersection size' = intersection_size(
+            mapping = aes(fill = baseline_mood_severity_category, bar_number_threshold=1)
+        )
+        + scale_y_continuous(expand=expansion(mult=c(0, 0.05)))
+      + theme(
+          # hide grid lines
+          panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),
+          # show axis lines
+          axis.line=element_line(colour='black')
+      )
+      + scale_fill_manual(values = c(
+            "Low" = '#D4E6F1',  # Lightest blue for "low"
+              "Not Low" = '#7FB3D5',  # Medium blue for "medium"
+              "High" = '#154360'  # Darkest blue for "high"
+        ), name = "Integrated Baseline Mood Severity")
+    ),
+    width_ratio = 0.1,
+    sort_sets = FALSE,
+    queries = list(
+        upset_query(set = "Worsening ASRM", fill = "#D82632"),
+        upset_query(set = "Worsening GAD-7", fill = "#D82632"),
+        upset_query(set = "Worsening PHQ-9", fill = "#D82632"),
+        upset_query(set = "Static ASRM", fill = "#FFE099"),
+        upset_query(set = "Static GAD-7", fill = "#FFE099"),
+        upset_query(set = "Static PHQ-9", fill = "#FFE099"),
+        upset_query(set = "Recovering ASRM", fill = "#264DFF"),
+        upset_query(set = "Recovering GAD-7", fill = "#264DFF"),
+        upset_query(set = "Recovering PHQ-9", fill = "#264DFF")
+    ),
+    matrix=intersection_matrix(
+      geom=geom_point(
+        shape='circle filled',
+        size=3.5,
+        stroke=0.45
+      )
+  ),
+  set_sizes=(
+    upset_set_size(geom=geom_bar(width=0.4))
+    + theme(
+      axis.line.x=element_line(colour='black'),
+      axis.ticks.x=element_line()
+    )
+  )
+)
+
+
+upset_data_filtered_BP2 <- upset_data_filtered %>%
+  left_join(BP_severity_score_filtered %>% select(record_id, baseline_mood_severity_category), by = "record_id")  %>% filter(record_id %in% bipolar2_id)
+
+sets <- c("ASRM_Recovering", "GAD_Recovering", "PHQ_Recovering",
+          "ASRM_Static", "GAD_Static", "PHQ_Static",
+          "ASRM_Worsening", "GAD_Worsening", "PHQ_Worsening")
+# Rename the columns by switching order and replacing underscores
+upset_data_filtered_BP2 <- upset_data_filtered_BP2 %>%
+  rename_at(vars(sets), ~ gsub("(.*)_(.*)", "\\2 \\1", .))
+
+colnames(upset_data_filtered_BP2) <- gsub("PHQ", "PHQ-9", colnames(upset_data_filtered_BP2))
+colnames(upset_data_filtered_BP2) <- gsub("GAD", "GAD-7", colnames(upset_data_filtered_BP2))
+
+
+sets <- colnames(upset_data_filtered_BP1)[c(-1,-11)]
+
+
+ComplexUpset::upset(
+    upset_data_filtered_BP2,
+    sets,
+    base_annotations = list(
+        'Intersection size' = intersection_size(
+            mapping = aes(fill = baseline_mood_severity_category, bar_number_threshold=1)
+        )
+        + scale_y_continuous(expand=expansion(mult=c(0, 0.05)))
+      + theme(
+          # hide grid lines
+          panel.grid.major=element_blank(),
+          panel.grid.minor=element_blank(),
+          # show axis lines
+          axis.line=element_line(colour='black')
+      )
+      + scale_fill_manual(values = c(
+            "Low" = '#D4E6F1',  # Lightest blue for "low"
+              "Not Low" = '#7FB3D5',  # Medium blue for "medium"
+              "High" = '#154360'  # Darkest blue for "high"
+        ), name = "Integrated Baseline Mood Severity")
+    ),
+    width_ratio = 0.1,
+    sort_sets = FALSE,
+    queries = list(
+        upset_query(set = "Worsening ASRM", fill = "#D82632"),
+        upset_query(set = "Worsening GAD-7", fill = "#D82632"),
+        upset_query(set = "Worsening PHQ-9", fill = "#D82632"),
+        upset_query(set = "Static ASRM", fill = "#FFE099"),
+        upset_query(set = "Static GAD-7", fill = "#FFE099"),
+        upset_query(set = "Static PHQ-9", fill = "#FFE099"),
+        upset_query(set = "Recovering ASRM", fill = "#264DFF"),
+        upset_query(set = "Recovering GAD-7", fill = "#264DFF"),
+        upset_query(set = "Recovering PHQ-9", fill = "#264DFF")
+    ),
+    matrix=intersection_matrix(
+      geom=geom_point(
+        shape='circle filled',
+        size=3.5,
+        stroke=0.45
+      )
+  ),
+  set_sizes=(
+    upset_set_size(geom=geom_bar(width=0.4))
+    + theme(
+      axis.line.x=element_line(colour='black'),
+      axis.ticks.x=element_line()
+    )
+  )
+)
+```
+
+#### Control LAMP #####
+
+```{r}
+Control_comorbidity = comorbidity_data %>% filter(be_dsmiv == "Healthy/Control (V71.09)")
+
+Control_PHQ_mergeData = read_data2(data = mood_data, id = control_id, score_name = "phq_score")[[3]] %>% rename(PHQ = value)
+Control_GAD_mergeData = read_data2(data = mood_data, id = control_id, score_name = "gad_score")[[3]] %>% rename(GAD = value)
+Control_ASRM_mergeData = read_data2(data = mood_data, id = control_id, score_name = "asrm_score")[[3]] %>% rename(ASRM = value)
+
+lmm_Control_PHQ_unadjust <- lmer(PHQ ~ years_from_baseline + (1 + years_from_baseline | record_id), data = Control_PHQ_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+temp = data.frame(record_id = unique(Control_PHQ_mergeData$record_id), Trajec_Intercept = coef(lmm_Control_PHQ_unadjust)$record_id[,1], Trajec_Slope = coef(lmm_Control_PHQ_unadjust)$record_id[,2])
+Control_PHQ_mergeData = inner_join(Control_PHQ_mergeData, temp, by =c("record_id"))
+Control_PHQ_mergeData_distinct <- Control_PHQ_mergeData[!duplicated(Control_PHQ_mergeData$record_id), ]
+
+
+lmm_Control_GAD_unadjust <- lmer(GAD ~ years_from_baseline + (1 + years_from_baseline | record_id), data = Control_GAD_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+temp = data.frame(record_id = unique(Control_GAD_mergeData$record_id), Trajec_Intercept = coef(lmm_Control_GAD_unadjust)$record_id[,1], Trajec_Slope = coef(lmm_Control_GAD_unadjust)$record_id[,2])
+Control_GAD_mergeData = inner_join(Control_GAD_mergeData, temp, by =c("record_id"))
+Control_GAD_mergeData_distinct <- Control_GAD_mergeData[!duplicated(Control_GAD_mergeData$record_id), ]
+
+lmm_Control_ASRM_unadjust <- lmer(ASRM ~ years_from_baseline + (1 + years_from_baseline | record_id), data = Control_ASRM_mergeData, REML = FALSE, control = lmerControl(optimizer ="Nelder_Mead"))
+temp = data.frame(record_id = unique(Control_ASRM_mergeData$record_id), Trajec_Intercept = coef(lmm_Control_ASRM_unadjust)$record_id[,1], Trajec_Slope = coef(lmm_Control_ASRM_unadjust)$record_id[,2])
+Control_ASRM_mergeData = inner_join(Control_ASRM_mergeData, temp, by =c("record_id"))
+Control_ASRM_mergeData_distinct <- Control_ASRM_mergeData[!duplicated(Control_ASRM_mergeData$record_id), ]
+```
+
+```{r}
+colnames(Control_PHQ_mergeData_distinct)[18:19] = c("PHQ_intercept", "PHQ_slope")
+#PHQ_slope_cut <- find_interval(Control_PHQ_mergeData_distinct$PHQ_slope)
+Control_PHQ_mergeData_distinct$PHQ_slope_group = cut(Control_PHQ_mergeData_distinct$PHQ_slope, breaks = c(-Inf, -PHQ_slope_cut, PHQ_slope_cut, Inf), labels = c("Decrease", "Flat", "Increase"))
+Control_PHQ_mergeData_distinct$PHQ_intercept_group = cut(Control_PHQ_mergeData_distinct$PHQ_intercept, breaks = c(-Inf, 4.5, 9.5, 14.5, Inf), labels = c("Low", "Mild", "Moderate", "Severe"))
+
+colnames(Control_GAD_mergeData_distinct)[18:19] = c("GAD_intercept", "GAD_slope")
+#GAD_slope_cut <- find_interval(Control_GAD_mergeData_distinct$GAD_slope)
+Control_GAD_mergeData_distinct$GAD_slope_group = cut(Control_GAD_mergeData_distinct$GAD_slope, breaks = c(-Inf, -GAD_slope_cut, GAD_slope_cut, Inf), labels = c("Decrease", "Flat", "Increase"))
+Control_GAD_mergeData_distinct$GAD_intercept_group = cut(Control_GAD_mergeData_distinct$GAD_intercept, breaks = c(-Inf, 4.5, 9.5, 14.5, Inf), labels = c("Minimal", "Mild", "Moderate", "Severe"))
+
+colnames(Control_ASRM_mergeData_distinct)[18:19] = c("ASRM_intercept", "ASRM_slope")
+#ASRM_slope_cut <- find_interval(Control_ASRM_mergeData_distinct$ASRM_slope)
+Control_ASRM_mergeData_distinct$ASRM_slope_group = cut(Control_ASRM_mergeData_distinct$ASRM_slope, breaks = c(-Inf, -ASRM_slope_cut, ASRM_slope_cut, Inf), labels = c("Decrease", "Flat", "Increase"))
+Control_ASRM_mergeData_distinct$ASRM_intercept_group = cut(Control_ASRM_mergeData_distinct$ASRM_intercept, breaks = c(-Inf, 5.5, Inf), labels = c("Low", "High"))
+```
+
+
+```{r}
+# PHQ
+Control_PHQ_mergeData2 <- merge(Control_PHQ_mergeData, Control_PHQ_mergeData_distinct[,c(1,20,21)], by = "record_id")
+ggplot(data= Control_PHQ_mergeData2, aes(x= years_from_baseline, y= PHQ, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) + ylab("PHQ")  + xlab("Years")
+time_points <- 0:15
+Control_PHQ_mergeData_distinct2 <- Control_PHQ_mergeData_distinct %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = PHQ_intercept + PHQ_slope * time)
+ggplot(data= Control_PHQ_mergeData_distinct2, aes(x= time, y= value, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) + ylab("PHQ")  + xlab("Years")
+
+
+Control_PHQ_mergeData_distinct2 <- Control_PHQ_mergeData_distinct %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = PHQ_intercept + PHQ_slope * time)
+avg_data <- Control_PHQ_mergeData_distinct2 %>%
+  group_by(PHQ_intercept_group, PHQ_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+ggplot(data= Control_PHQ_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(PHQ_intercept_group, PHQ_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(PHQ_intercept_group), levels = c("Severe", "Moderate", "Mild", "Low"), ordered = TRUE) ~ PHQ_slope_group) + 
+  ylab("PHQ") + 
+  xlab("Years")
+
+# GAD
+Control_GAD_mergeData2 <- merge(Control_GAD_mergeData, Control_GAD_mergeData_distinct[,c(1,20,21)], by = "record_id")
+ggplot(data= Control_GAD_mergeData2, aes(x= years_from_baseline, y= GAD, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) + ylab("GAD")  + xlab("Years")
+time_points <- 0:15
+Control_GAD_mergeData_distinct2 <- Control_GAD_mergeData_distinct %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = GAD_intercept + GAD_slope * time)
+ggplot(data= Control_GAD_mergeData_distinct2, aes(x= time, y= value, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) + ylab("GAD")  + xlab("Years")
+
+Control_GAD_mergeData_distinct2 <- Control_GAD_mergeData_distinct %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = GAD_intercept + GAD_slope * time)
+avg_data <- Control_GAD_mergeData_distinct2 %>%
+  group_by(GAD_intercept_group, GAD_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+ggplot(data= Control_GAD_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(GAD_intercept_group, GAD_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(GAD_intercept_group), levels = c("Severe", "Moderate", "Mild", "Minimal"), ordered = TRUE) ~ GAD_slope_group) + 
+  ylab("GAD") + 
+  xlab("Years")
+
+# ASRM
+Control_ASRM_mergeData2 <- merge(Control_ASRM_mergeData, Control_ASRM_mergeData_distinct[,c(1,20,21)], by = "record_id")
+ggplot(data= Control_ASRM_mergeData2, aes(x= years_from_baseline, y= ASRM, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High","Low"), ordered = TRUE) ~ ASRM_slope_group) + ylab("ASRM")  + xlab("Years")
+time_points <- 0:15
+Control_ASRM_mergeData_distinct2 <- Control_ASRM_mergeData_distinct %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = ASRM_intercept + ASRM_slope * time)
+ggplot(data= Control_ASRM_mergeData_distinct2, aes(x= time, y= value, group= record_id, colour = record_id)) +  geom_line() + facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High", "Low"), ordered = TRUE) ~ ASRM_slope_group) + ylab("ASRM")  + xlab("Years")
+
+
+Control_ASRM_mergeData_distinct2 <- Control_ASRM_mergeData_distinct %>% 
+  mutate(time = list(time_points)) %>% 
+  unnest(cols = c(time)) %>% 
+  mutate(value = ASRM_intercept + ASRM_slope * time)
+avg_data <- Control_ASRM_mergeData_distinct2 %>%
+  group_by(ASRM_intercept_group, ASRM_slope_group, time) %>%
+  summarise(avg_value = mean(value))
+ggplot(data= Control_ASRM_mergeData_distinct2, aes(x= time, y= value, group= record_id)) + 
+  geom_line(aes(color = record_id), show.legend = FALSE, color = "grey") + 
+  geom_line(data = avg_data, aes(y = avg_value, group = interaction(ASRM_intercept_group, ASRM_slope_group)), color = "blue") +
+  facet_grid(factor(str_to_title(ASRM_intercept_group), levels = c("High", "Low"), ordered = TRUE) ~ ASRM_slope_group) + 
+  ylab("ASRM") + 
+  xlab("Years")
+```
+#### Data Annotation ####
+```{r}
+BP1_BP2_record_id = comorbidity_data %>% filter(be_dsmiv %in% c("Bipolar 1 (296.70A)", "Bipolar 2 with Recurrent Depression (296.89R)")) %>% select(record_id)
+
+BP_PHQ_mergeData_distinct = BP_PHQ_mergeData_distinct %>% filter(record_id %in% BP1_BP2_record_id$record_id)
+BP_GAD_mergeData_distinct = BP_GAD_mergeData_distinct %>% filter(record_id %in% BP1_BP2_record_id$record_id)
+BP_ASRM_mergeData_distinct = BP_ASRM_mergeData_distinct %>% filter(record_id %in% BP1_BP2_record_id$record_id)
+BP_severity_score_filtered = BP_severity_score_filtered %>% filter(record_id %in% BP1_BP2_record_id$record_id)
+BP_mergeData_distinct_filtered = BP_mergeData_distinct_filtered %>% filter(record_id %in% BP1_BP2_record_id$record_id)
+
+
+# PHQ
+BP_PHQ_mergeData_distinct_temp = BP_PHQ_mergeData_distinct
+BP_PHQ_mergeData_distinct_temp <- BP_PHQ_mergeData_distinct_temp %>%
+  mutate(
+    New_Group = case_when(
+      Slope_Group == "Recovering" | (Slope_Group == "Static" & Intercept_Group == "Low") ~ "Stable/Recovering",
+      Slope_Group == "Worsening" | (Slope_Group == "Static" & Intercept_Group %in% c("Mild", "Moderate", "Severe")) ~ "Resistant/Worsening",
+      TRUE ~ NA_character_  # Handles cases that don't fit either category, if any
+    ),
+    # Convert the new grouping to a factor if not already
+    New_Group = factor(New_Group, levels = c("Stable/Recovering", "Resistant/Worsening"))
+  )
+
+BP_PHQ_mergeData_distinct_temp$Antiepileptics_Freq_percent = BP_PHQ_mergeData_distinct_temp$Antiepileptics_Freq*100
+BP_PHQ_mergeData_distinct_temp$Antipsychotics_Freq_percent = BP_PHQ_mergeData_distinct_temp$Antipsychotics_Freq*100
+BP_PHQ_mergeData_distinct_temp$Antidepressants_Freq_percent = BP_PHQ_mergeData_distinct_temp$Antidepressants_Freq*100
+BP_PHQ_mergeData_distinct_temp$Anxiolytics_Freq_percent = BP_PHQ_mergeData_distinct_temp$Anxiolytics_Freq*100
+BP_PHQ_mergeData_distinct_temp$Lithium_Freq_percent = BP_PHQ_mergeData_distinct_temp$Lithium_Freq*100
+BP_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = BP_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq*100
+
+BP_PHQ_mergeData_distinct_temp <- BP_PHQ_mergeData_distinct_temp %>%
+  mutate(
+    Slope_Group = factor(Slope_Group , levels = c("Recovering", "Worsening")),
+    be_alcohol = factor(be_alcohol, levels = c("No", "Yes")),
+    be_cannabis = factor(be_cannabis, levels = c("No", "Yes")),
+    be_cocaine = factor(be_cocaine, levels = c("No", "Yes")),
+    be_specificphobia = factor(be_specificphobia, levels = c("No", "Yes")),
+    be_ptsd = factor(be_ptsd, levels = c("No", "Yes")),
+    digs_head_injury = factor(digs_head_injury, levels = c("No", "Yes")),
+    digs_migraine = factor(digs_migraine, levels = c("No", "Yes")),
+    digs_overweight = factor(digs_overweight, levels = c("No", "Yes"))
+  )
+
+BP_PHQ_mergeData_distinct_temp$PHQ_intercept = BP_PHQ_mergeData_distinct_temp$PHQ_intercept %>% ff_label("Baseline PHQ")
+BP_PHQ_mergeData_distinct_temp$gender = BP_PHQ_mergeData_distinct_temp$gender %>% ff_label("Gender")
+BP_PHQ_mergeData_distinct_temp$measure_age = BP_PHQ_mergeData_distinct_temp$measure_age %>% ff_label("Age at Baseline")
+BP_PHQ_mergeData_distinct_temp$baseline_marital_status = BP_PHQ_mergeData_distinct_temp$baseline_marital_status %>% ff_label("Marital Status at Baseline")
+BP_PHQ_mergeData_distinct_temp$Average_Med = BP_PHQ_mergeData_distinct_temp$Average_Med %>% ff_label("Average Number of Concurrent Medications")
+BP_PHQ_mergeData_distinct_temp$Antiepileptics_Freq_percent = BP_PHQ_mergeData_distinct_temp$Antiepileptics_Freq_percent %>% ff_label("Antiepileptics Use Frequency (%)")
+BP_PHQ_mergeData_distinct_temp$Antipsychotics_Freq_percent = BP_PHQ_mergeData_distinct_temp$Antipsychotics_Freq_percent %>% ff_label("Antipsychotics Use Frequency (%)")
+BP_PHQ_mergeData_distinct_temp$Antidepressants_Freq_percent = BP_PHQ_mergeData_distinct_temp$Antidepressants_Freq_percent %>% ff_label("Antidepressants Use Frequency (%)")
+BP_PHQ_mergeData_distinct_temp$Anxiolytics_Freq_percent = BP_PHQ_mergeData_distinct_temp$Anxiolytics_Freq_percent %>% ff_label("Anxiolytics Use Frequency (%)")
+BP_PHQ_mergeData_distinct_temp$Lithium_Freq_percent = BP_PHQ_mergeData_distinct_temp$Lithium_Freq_percent %>% ff_label("Lithium Use Frequency (%)")
+BP_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = BP_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent %>% ff_label("Mood Stabilizer Use Frequency (%)")
+BP_PHQ_mergeData_distinct_temp$be_alcohol = BP_PHQ_mergeData_distinct_temp$be_alcohol %>% ff_label("Alcohol Use Disorder")
+BP_PHQ_mergeData_distinct_temp$be_cannabis = BP_PHQ_mergeData_distinct_temp$be_cannabis %>% ff_label("Cannabis Use Disorder")
+BP_PHQ_mergeData_distinct_temp$be_cocaine = BP_PHQ_mergeData_distinct_temp$be_cocaine %>% ff_label("Cocaine Use Disorder")
+BP_PHQ_mergeData_distinct_temp$be_specificphobia = BP_PHQ_mergeData_distinct_temp$be_specificphobia %>% ff_label("Specific Phobia")
+BP_PHQ_mergeData_distinct_temp$be_ptsd = BP_PHQ_mergeData_distinct_temp$be_ptsd %>% ff_label("PTSD")
+BP_PHQ_mergeData_distinct_temp$digs_head_injury = BP_PHQ_mergeData_distinct_temp$digs_head_injury %>% ff_label("Head Injury")
+BP_PHQ_mergeData_distinct_temp$digs_migraine = BP_PHQ_mergeData_distinct_temp$digs_migraine %>% ff_label("Migraine")
+BP_PHQ_mergeData_distinct_temp$digs_overweight = BP_PHQ_mergeData_distinct_temp$digs_overweight %>% ff_label("Overweight")
+
+
+Control_comorbidity = Control_comorbidity %>% filter(record_id %in% Control_PHQ_mergeData_distinct$record_id)
+Control_PHQ_mergeData_distinct <- left_join(Control_PHQ_mergeData_distinct, Control_comorbidity[,-3], by = "record_id")
+Control_PHQ_mergeData_distinct_temp = Control_PHQ_mergeData_distinct
+
+Control_PHQ_mergeData_distinct_temp$Antiepileptics_Freq_percent = Control_PHQ_mergeData_distinct_temp$Antiepileptics_Freq*100
+Control_PHQ_mergeData_distinct_temp$Antipsychotics_Freq_percent = Control_PHQ_mergeData_distinct_temp$Antipsychotics_Freq*100
+Control_PHQ_mergeData_distinct_temp$Antidepressants_Freq_percent = Control_PHQ_mergeData_distinct_temp$Antidepressants_Freq*100
+Control_PHQ_mergeData_distinct_temp$Anxiolytics_Freq_percent = Control_PHQ_mergeData_distinct_temp$Anxiolytics_Freq*100
+Control_PHQ_mergeData_distinct_temp$Lithium_Freq_percent = Control_PHQ_mergeData_distinct_temp$Lithium_Freq*100
+Control_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = Control_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq*100
+
+Control_PHQ_mergeData_distinct_temp <- Control_PHQ_mergeData_distinct_temp %>%
+  mutate(
+    be_alcohol = factor(be_alcohol, levels = c("No", "Yes")),
+    be_cannabis = factor(be_cannabis, levels = c("No", "Yes")),
+    be_cocaine = factor(be_cocaine, levels = c("No", "Yes")),
+    be_specificphobia = factor(be_specificphobia, levels = c("No", "Yes")),
+    be_ptsd = factor(be_ptsd, levels = c("No", "Yes")),
+    digs_head_injury = factor(digs_head_injury, levels = c("No", "Yes")),
+    digs_migraine = factor(digs_migraine, levels = c("No", "Yes")),
+    digs_overweight = factor(digs_overweight, levels = c("No", "Yes"))
+  )
+
+Control_PHQ_mergeData_distinct_temp$PHQ_intercept = Control_PHQ_mergeData_distinct_temp$PHQ_intercept %>% ff_label("Baseline PHQ")
+Control_PHQ_mergeData_distinct_temp$gender = Control_PHQ_mergeData_distinct_temp$gender %>% ff_label("Gender")
+Control_PHQ_mergeData_distinct_temp$measure_age = Control_PHQ_mergeData_distinct_temp$measure_age %>% ff_label("Age at Baseline")
+Control_PHQ_mergeData_distinct_temp$baseline_marital_status = Control_PHQ_mergeData_distinct_temp$baseline_marital_status %>% ff_label("Marital Status at Baseline")
+Control_PHQ_mergeData_distinct_temp$Average_Med = Control_PHQ_mergeData_distinct_temp$Average_Med %>% ff_label("Average Number of Concurrent Medications")
+Control_PHQ_mergeData_distinct_temp$Antiepileptics_Freq_percent = Control_PHQ_mergeData_distinct_temp$Antiepileptics_Freq_percent %>% ff_label("Antiepileptics Use Frequency (%)")
+Control_PHQ_mergeData_distinct_temp$Antipsychotics_Freq_percent = Control_PHQ_mergeData_distinct_temp$Antipsychotics_Freq_percent %>% ff_label("Antipsychotics Use Frequency (%)")
+Control_PHQ_mergeData_distinct_temp$Antidepressants_Freq_percent = Control_PHQ_mergeData_distinct_temp$Antidepressants_Freq_percent %>% ff_label("Antidepressants Use Frequency (%)")
+Control_PHQ_mergeData_distinct_temp$Anxiolytics_Freq_percent = Control_PHQ_mergeData_distinct_temp$Anxiolytics_Freq_percent %>% ff_label("Anxiolytics Use Frequency (%)")
+Control_PHQ_mergeData_distinct_temp$Lithium_Freq_percent = Control_PHQ_mergeData_distinct_temp$Lithium_Freq_percent %>% ff_label("Lithium Use Frequency (%)")
+Control_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = Control_PHQ_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent %>% ff_label("Mood Stabilizer Use Frequency (%)")
+Control_PHQ_mergeData_distinct_temp$be_alcohol = Control_PHQ_mergeData_distinct_temp$be_alcohol %>% ff_label("Alcohol Use Disorder")
+Control_PHQ_mergeData_distinct_temp$be_cannabis = Control_PHQ_mergeData_distinct_temp$be_cannabis %>% ff_label("Cannabis Use Disorder")
+Control_PHQ_mergeData_distinct_temp$be_cocaine = Control_PHQ_mergeData_distinct_temp$be_cocaine %>% ff_label("Cocaine Use Disorder")
+Control_PHQ_mergeData_distinct_temp$be_specificphobia = Control_PHQ_mergeData_distinct_temp$be_specificphobia %>% ff_label("Specific Phobia")
+Control_PHQ_mergeData_distinct_temp$be_ptsd = Control_PHQ_mergeData_distinct_temp$be_ptsd %>% ff_label("PTSD")
+Control_PHQ_mergeData_distinct_temp$digs_head_injury = Control_PHQ_mergeData_distinct_temp$digs_head_injury %>% ff_label("Head Injury")
+Control_PHQ_mergeData_distinct_temp$digs_migraine = Control_PHQ_mergeData_distinct_temp$digs_migraine %>% ff_label("Migraine")
+Control_PHQ_mergeData_distinct_temp$digs_overweight = Control_PHQ_mergeData_distinct_temp$digs_overweight %>% ff_label("Overweight")
+
+# GAD
+BP_GAD_mergeData_distinct_temp = BP_GAD_mergeData_distinct
+BP_GAD_mergeData_distinct_temp <- BP_GAD_mergeData_distinct_temp %>%
+  mutate(
+    New_Group = case_when(
+      Slope_Group == "Recovering" | (Slope_Group == "Static" & Intercept_Group == "Minimal") ~ "Stable/Recovering",
+      Slope_Group == "Worsening" | (Slope_Group == "Static" & Intercept_Group %in% c("Mild", "Moderate", "Severe")) ~ "Resistant/Worsening",
+      TRUE ~ NA_character_  # Handles cases that don't fit either category, if any
+    ),
+    # Convert the new grouping to a factor if not already
+    New_Group = factor(New_Group, levels = c("Stable/Recovering", "Resistant/Worsening"))
+  )
+
+BP_GAD_mergeData_distinct_temp$Antiepileptics_Freq_percent = BP_GAD_mergeData_distinct_temp$Antiepileptics_Freq*100
+BP_GAD_mergeData_distinct_temp$Antipsychotics_Freq_percent = BP_GAD_mergeData_distinct_temp$Antipsychotics_Freq*100
+BP_GAD_mergeData_distinct_temp$Antidepressants_Freq_percent = BP_GAD_mergeData_distinct_temp$Antidepressants_Freq*100
+BP_GAD_mergeData_distinct_temp$Anxiolytics_Freq_percent = BP_GAD_mergeData_distinct_temp$Anxiolytics_Freq*100
+BP_GAD_mergeData_distinct_temp$Lithium_Freq_percent = BP_GAD_mergeData_distinct_temp$Lithium_Freq*100
+BP_GAD_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = BP_GAD_mergeData_distinct_temp$Mood_Stabilizer_Freq*100
+
+
+BP_GAD_mergeData_distinct_temp <- BP_GAD_mergeData_distinct_temp %>%
+  mutate(
+    Slope_Group = factor(Slope_Group , levels = c("Recovering", "Worsening")),
+    be_alcohol = factor(be_alcohol, levels = c("No", "Yes")),
+    be_cannabis = factor(be_cannabis, levels = c("No", "Yes")),
+    be_cocaine = factor(be_cocaine, levels = c("No", "Yes")),
+    be_specificphobia = factor(be_specificphobia, levels = c("No", "Yes")),
+    be_ptsd = factor(be_ptsd, levels = c("No", "Yes")),
+    digs_head_injury = factor(digs_head_injury, levels = c("No", "Yes")),
+    digs_migraine = factor(digs_migraine, levels = c("No", "Yes")),
+    digs_overweight = factor(digs_overweight, levels = c("No", "Yes"))
+  )
+
+BP_GAD_mergeData_distinct_temp$GAD_intercept = BP_GAD_mergeData_distinct_temp$GAD_intercept %>% ff_label("Baseline GAD")
+BP_GAD_mergeData_distinct_temp$gender = BP_GAD_mergeData_distinct_temp$gender %>% ff_label("Gender")
+BP_GAD_mergeData_distinct_temp$measure_age = BP_GAD_mergeData_distinct_temp$measure_age %>% ff_label("Age at Baseline")
+BP_GAD_mergeData_distinct_temp$baseline_marital_status = BP_GAD_mergeData_distinct_temp$baseline_marital_status %>% ff_label("Marital Status at Baseline")
+BP_GAD_mergeData_distinct_temp$Average_Med = BP_GAD_mergeData_distinct_temp$Average_Med %>% ff_label("Average Number of Concurrent Medications")
+BP_GAD_mergeData_distinct_temp$Antiepileptics_Freq_percent = BP_GAD_mergeData_distinct_temp$Antiepileptics_Freq_percent %>% ff_label("Antiepileptics Use Frequency (%)")
+BP_GAD_mergeData_distinct_temp$Antipsychotics_Freq_percent = BP_GAD_mergeData_distinct_temp$Antipsychotics_Freq_percent %>% ff_label("Antipsychotics Use Frequency (%)")
+BP_GAD_mergeData_distinct_temp$Antidepressants_Freq_percent = BP_GAD_mergeData_distinct_temp$Antidepressants_Freq_percent %>% ff_label("Antidepressants Use Frequency (%)")
+BP_GAD_mergeData_distinct_temp$Anxiolytics_Freq_percent = BP_GAD_mergeData_distinct_temp$Anxiolytics_Freq_percent %>% ff_label("Anxiolytics Use Frequency (%)")
+BP_GAD_mergeData_distinct_temp$Lithium_Freq_percent = BP_GAD_mergeData_distinct_temp$Lithium_Freq_percent %>% ff_label("Lithium Use Frequency (%)")
+BP_GAD_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = BP_GAD_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent %>% ff_label("Mood Stabilizer Use Frequency (%)")
+BP_GAD_mergeData_distinct_temp$be_alcohol = BP_GAD_mergeData_distinct_temp$be_alcohol %>% ff_label("Alcohol Use Disorder")
+BP_GAD_mergeData_distinct_temp$be_cannabis = BP_GAD_mergeData_distinct_temp$be_cannabis %>% ff_label("Cannabis Use Disorder")
+BP_GAD_mergeData_distinct_temp$be_cocaine = BP_GAD_mergeData_distinct_temp$be_cocaine %>% ff_label("Cocaine Use Disorder")
+BP_GAD_mergeData_distinct_temp$be_specificphobia = BP_GAD_mergeData_distinct_temp$be_specificphobia %>% ff_label("Specific Phobia")
+BP_GAD_mergeData_distinct_temp$be_ptsd = BP_GAD_mergeData_distinct_temp$be_ptsd %>% ff_label("PTSD")
+BP_GAD_mergeData_distinct_temp$digs_head_injury = BP_GAD_mergeData_distinct_temp$digs_head_injury %>% ff_label("Head Injury")
+BP_GAD_mergeData_distinct_temp$digs_migraine = BP_GAD_mergeData_distinct_temp$digs_migraine %>% ff_label("Migraine")
+BP_GAD_mergeData_distinct_temp$digs_overweight = BP_GAD_mergeData_distinct_temp$digs_overweight %>% ff_label("Overweight")
+
+#ASRM
+BP_ASRM_mergeData_distinct_temp = BP_ASRM_mergeData_distinct
+BP_ASRM_mergeData_distinct_temp <- BP_ASRM_mergeData_distinct_temp %>%
+  mutate(
+    New_Group = case_when(
+      Slope_Group == "Recovering" | (Slope_Group == "Static" & Intercept_Group == "Low") ~ "Stable/Recovering",
+      Slope_Group == "Worsening" | (Slope_Group == "Static" & Intercept_Group %in% c("High")) ~ "Resistant/Worsening",
+      TRUE ~ NA_character_  # Handles cases that don't fit either category, if any
+    ),
+    # Convert the new grouping to a factor if not already
+    New_Group = factor(New_Group, levels = c("Stable/Recovering", "Resistant/Worsening"))
+  )
+
+BP_ASRM_mergeData_distinct_temp$Antiepileptics_Freq_percent = BP_ASRM_mergeData_distinct_temp$Antiepileptics_Freq*100
+BP_ASRM_mergeData_distinct_temp$Antipsychotics_Freq_percent = BP_ASRM_mergeData_distinct_temp$Antipsychotics_Freq*100
+BP_ASRM_mergeData_distinct_temp$Antidepressants_Freq_percent = BP_ASRM_mergeData_distinct_temp$Antidepressants_Freq*100
+BP_ASRM_mergeData_distinct_temp$Anxiolytics_Freq_percent = BP_ASRM_mergeData_distinct_temp$Anxiolytics_Freq*100
+BP_ASRM_mergeData_distinct_temp$Lithium_Freq_percent = BP_ASRM_mergeData_distinct_temp$Lithium_Freq*100
+BP_ASRM_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = BP_ASRM_mergeData_distinct_temp$Mood_Stabilizer_Freq*100
+
+BP_ASRM_mergeData_distinct_temp <- BP_ASRM_mergeData_distinct_temp %>%
+  mutate(
+    Slope_Group = factor(Slope_Group , levels = c("Recovering", "Worsening")),
+    be_alcohol = factor(be_alcohol, levels = c("No", "Yes")),
+    be_cannabis = factor(be_cannabis, levels = c("No", "Yes")),
+    be_cocaine = factor(be_cocaine, levels = c("No", "Yes")),
+    be_specificphobia = factor(be_specificphobia, levels = c("No", "Yes")),
+    be_ptsd = factor(be_ptsd, levels = c("No", "Yes")),
+    digs_head_injury = factor(digs_head_injury, levels = c("No", "Yes")),
+    digs_migraine = factor(digs_migraine, levels = c("No", "Yes")),
+    digs_overweight = factor(digs_overweight, levels = c("No", "Yes"))
+  )
+
+BP_ASRM_mergeData_distinct_temp$ASRM_intercept = BP_ASRM_mergeData_distinct_temp$ASRM_intercept %>% ff_label("Baseline ASRM")
+BP_ASRM_mergeData_distinct_temp$gender = BP_ASRM_mergeData_distinct_temp$gender %>% ff_label("Gender")
+BP_ASRM_mergeData_distinct_temp$measure_age = BP_ASRM_mergeData_distinct_temp$measure_age %>% ff_label("Age at Baseline")
+BP_ASRM_mergeData_distinct_temp$baseline_marital_status = BP_ASRM_mergeData_distinct_temp$baseline_marital_status %>% ff_label("Marital Status at Baseline")
+BP_ASRM_mergeData_distinct_temp$Average_Med = BP_ASRM_mergeData_distinct_temp$Average_Med %>% ff_label("Average Number of Concurrent Medications")
+BP_ASRM_mergeData_distinct_temp$Antiepileptics_Freq_percent = BP_ASRM_mergeData_distinct_temp$Antiepileptics_Freq_percent %>% ff_label("Antiepileptics Use Frequency (%)")
+BP_ASRM_mergeData_distinct_temp$Antipsychotics_Freq_percent = BP_ASRM_mergeData_distinct_temp$Antipsychotics_Freq_percent %>% ff_label("Antipsychotics Use Frequency (%)")
+BP_ASRM_mergeData_distinct_temp$Antidepressants_Freq_percent = BP_ASRM_mergeData_distinct_temp$Antidepressants_Freq_percent %>% ff_label("Antidepressants Use Frequency (%)")
+BP_ASRM_mergeData_distinct_temp$Anxiolytics_Freq_percent = BP_ASRM_mergeData_distinct_temp$Anxiolytics_Freq_percent %>% ff_label("Anxiolytics Use Frequency (%)")
+BP_ASRM_mergeData_distinct_temp$Lithium_Freq_percent = BP_ASRM_mergeData_distinct_temp$Lithium_Freq_percent %>% ff_label("Lithium Use Frequency (%)")
+BP_ASRM_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent = BP_ASRM_mergeData_distinct_temp$Mood_Stabilizer_Freq_percent %>% ff_label("Mood Stabilizer Use Frequency (%)")
+BP_ASRM_mergeData_distinct_temp$be_alcohol = BP_ASRM_mergeData_distinct_temp$be_alcohol %>% ff_label("Alcohol Use Disorder")
+BP_ASRM_mergeData_distinct_temp$be_cannabis = BP_ASRM_mergeData_distinct_temp$be_cannabis %>% ff_label("Cannabis Use Disorder")
+BP_ASRM_mergeData_distinct_temp$be_cocaine = BP_ASRM_mergeData_distinct_temp$be_cocaine %>% ff_label("Cocaine Use Disorder")
+BP_ASRM_mergeData_distinct_temp$be_specificphobia = BP_ASRM_mergeData_distinct_temp$be_specificphobia %>% ff_label("Specific Phobia")
+BP_ASRM_mergeData_distinct_temp$be_ptsd = BP_ASRM_mergeData_distinct_temp$be_ptsd %>% ff_label("PTSD")
+BP_ASRM_mergeData_distinct_temp$digs_head_injury = BP_ASRM_mergeData_distinct_temp$digs_head_injury %>% ff_label("Head Injury")
+BP_ASRM_mergeData_distinct_temp$digs_migraine = BP_ASRM_mergeData_distinct_temp$digs_migraine %>% ff_label("Migraine")
+BP_ASRM_mergeData_distinct_temp$digs_overweight = BP_ASRM_mergeData_distinct_temp$digs_overweight %>% ff_label("Overweight")
+
+# Integrated Data
+BP_mergeData_distinct_filtered_temp = BP_mergeData_distinct_filtered
+BP_mergeData_distinct_filtered_temp <- BP_mergeData_distinct_filtered_temp %>%
+  mutate(Recovering = Slope_Group == "Recovering",
+         Stable = Slope_Group == "Static",
+         Worsening = Slope_Group == "Worsening")
+
+individual_summary <- BP_mergeData_distinct_filtered_temp %>%
+  group_by(record_id) %>%
+  summarise(Recovering_Count = sum(Recovering, na.rm = TRUE),
+            Stable_Count = sum(Stable, na.rm = TRUE),
+            Worsening_Count = sum(Worsening, na.rm = TRUE)) %>%
+  ungroup()
+
+individual_summary_with_baseline <- individual_summary %>%
+  left_join(BP_severity_score_filtered %>% select(record_id, baseline_mood_severity_category), by = "record_id")
+
+individual_summary_with_baseline <- individual_summary_with_baseline %>%
+  mutate(Group = case_when(
+    (Stable_Count >= 2 & baseline_mood_severity_category == "Low") | Recovering_Count >= 2 ~ "Stable/Recovering",
+    (Stable_Count >= 2 & baseline_mood_severity_category %in% c("Not Low")) | Worsening_Count >= 2 ~ "Resistant/Worsening"
+  ))
+filtered_data <- individual_summary_with_baseline %>%
+  filter(!is.na(Group))
+
+BP_PHQ_mergeData_distinct_updated <- BP_PHQ_mergeData_distinct_temp %>%
+  left_join(BP_GAD_mergeData_distinct_temp %>% select(record_id, GAD_intercept), by = "record_id") %>%
+  left_join(BP_ASRM_mergeData_distinct_temp %>% select(record_id, ASRM_intercept), by = "record_id") %>%
+  left_join(BP_severity_score_filtered %>% select(record_id, baseline_mood_severity_category), by = "record_id")
+
+BP_final_dataset <- BP_PHQ_mergeData_distinct_updated %>%
+  right_join(filtered_data %>% select(record_id, Group), by = "record_id")
+
+dependent <- "Group"
+BP_final_dataset$Group = factor(BP_final_dataset$Group, levels = c("Stable/Recovering", "Resistant/Worsening"))
+BP_final_dataset$Group = BP_final_dataset$Group %>% ff_label("Combined Score Progress")
+
+BP_final_dataset$baseline_mood_severity_category = factor(BP_final_dataset$baseline_mood_severity_category, levels = c("Low", "Not Low"))
+BP_final_dataset$baseline_mood_severity_category = BP_final_dataset$baseline_mood_severity_category %>% ff_label("Baseline Mood Severity")
+
+BP_final_dataset$Antiepileptics_Freq_percent = BP_final_dataset$Antiepileptics_Freq*100
+BP_final_dataset$Antipsychotics_Freq_percent = BP_final_dataset$Antipsychotics_Freq*100
+BP_final_dataset$Antidepressants_Freq_percent = BP_final_dataset$Antidepressants_Freq*100
+BP_final_dataset$Anxiolytics_Freq_percent = BP_final_dataset$Anxiolytics_Freq*100
+BP_final_dataset$Lithium_Freq_percent = BP_final_dataset$Lithium_Freq*100
+BP_final_dataset$Mood_Stabilizer_Freq_percent = BP_final_dataset$Mood_Stabilizer_Freq*100
+```
+
+```{r}
+BP1_PHQ_mergeData_distinct_temp = BP_PHQ_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 1 (296.70A)")
+BP1_PHQ_mergeData_distinct_temp$disease_type = "BP1"
+BP1_PHQ_mergeData_distinct_temp$Score_Type = "PHQ-9"
+BP1_GAD_mergeData_distinct_temp = BP_GAD_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 1 (296.70A)")
+BP1_GAD_mergeData_distinct_temp$disease_type = "BP1"
+BP1_GAD_mergeData_distinct_temp$Score_Type = "GAD-7"
+BP1_ASRM_mergeData_distinct_temp = BP_ASRM_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 1 (296.70A)")
+BP1_ASRM_mergeData_distinct_temp$disease_type = "BP1"
+BP1_final_dataset = BP_final_dataset %>% filter(be_dsmiv == "Bipolar 1 (296.70A)")
+BP1_final_dataset$disease_type = "BP1"
+BP1_final_dataset_clean = BP1_final_dataset
+BP1_final_dataset_clean$New_Group = BP1_final_dataset_clean$Group
+BP1_final_dataset_clean = BP1_final_dataset_clean[, -c(43:46)]
+BP1_final_dataset_clean$Score_Type = "Integrated"
+
+BP2_PHQ_mergeData_distinct_temp = BP_PHQ_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)")
+BP2_PHQ_mergeData_distinct_temp$disease_type = "BP2"
+BP2_PHQ_mergeData_distinct_temp$Score_Type = "PHQ-9"
+BP2_GAD_mergeData_distinct_temp = BP_GAD_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)")
+BP2_GAD_mergeData_distinct_temp$disease_type = "BP2"
+BP2_GAD_mergeData_distinct_temp$Score_Type = "GAD-7"
+BP2_ASRM_mergeData_distinct_temp = BP_ASRM_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)")
+BP2_ASRM_mergeData_distinct_temp$disease_type = "BP2"
+BP2_final_dataset = BP_final_dataset %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)")
+BP2_final_dataset$disease_type = "BP2"
+BP2_final_dataset_clean = BP2_final_dataset
+BP2_final_dataset_clean$New_Group = BP2_final_dataset_clean$Group
+BP2_final_dataset_clean = BP2_final_dataset_clean[, -c(43:46)]
+BP2_final_dataset_clean$Score_Type = "Integrated"
+
+BP1_inference_descip_data = rbind(BP1_PHQ_mergeData_distinct_temp, BP1_GAD_mergeData_distinct_temp, BP1_ASRM_mergeData_distinct_temp, BP1_final_dataset_clean)
+BP2_inference_descip_data = rbind(BP2_PHQ_mergeData_distinct_temp, BP2_GAD_mergeData_distinct_temp, BP2_ASRM_mergeData_distinct_temp, BP2_final_dataset_clean)
+
+BP1_inference_descip_data$be_specificphobia <- factor(BP1_inference_descip_data$be_specificphobia, levels = c("Yes", "No"))
+BP1_inference_descip_data$be_ptsd <- factor(BP1_inference_descip_data$be_ptsd, levels = c("Yes", "No"))
+BP1_inference_descip_data$digs_head_injury <- factor(BP1_inference_descip_data$digs_head_injury, levels = c("Yes", "No"))
+BP1_inference_descip_data$digs_migraine <- factor(BP1_inference_descip_data$digs_migraine, levels = c("Yes", "No"))
+BP1_inference_descip_data$digs_overweight <- factor(BP1_inference_descip_data$digs_overweight, levels = c("Yes", "No"))
+BP1_inference_descip_data$be_alcohol <- factor(BP1_inference_descip_data$be_alcohol, levels = c("Yes", "No"))
+BP1_inference_descip_data$be_cannabis <- factor(BP1_inference_descip_data$be_cannabis, levels = c("Yes", "No"))
+BP1_inference_descip_data$be_cocaine <- factor(BP1_inference_descip_data$be_cocaine, levels = c("Yes", "No"))
+BP1_inference_descip_data$Score_Type <- factor(BP1_inference_descip_data$Score_Type, levels = c("PHQ-9", "GAD-7", "ASRM", "Integrated"))
+
+
+BP2_inference_descip_data$be_specificphobia <- factor(BP2_inference_descip_data$be_specificphobia, levels = c("Yes", "No"))
+BP2_inference_descip_data$be_ptsd <- factor(BP2_inference_descip_data$be_ptsd, levels = c("Yes", "No"))
+BP2_inference_descip_data$digs_head_injury <- factor(BP2_inference_descip_data$digs_head_injury, levels = c("Yes", "No"))
+BP2_inference_descip_data$digs_migraine <- factor(BP2_inference_descip_data$digs_migraine, levels = c("Yes", "No"))
+BP2_inference_descip_data$digs_overweight <- factor(BP2_inference_descip_data$digs_overweight, levels = c("Yes", "No"))
+BP2_inference_descip_data$be_alcohol <- factor(BP2_inference_descip_data$be_alcohol, levels = c("Yes", "No"))
+BP2_inference_descip_data$be_cannabis <- factor(BP2_inference_descip_data$be_cannabis, levels = c("Yes", "No"))
+BP2_inference_descip_data$be_cocaine <- factor(BP2_inference_descip_data$be_cocaine, levels = c("Yes", "No"))
+BP2_inference_descip_data$Score_Type <- factor(BP2_inference_descip_data$Score_Type, levels = c("PHQ-9", "GAD-7", "ASRM", "Integrated"))
+
+label(BP1_inference_descip_data$gender)   <- "Gender"
+label(BP1_inference_descip_data$measure_age)   <- "Age at Baseline"
+label(BP1_inference_descip_data$baseline_marital_status)   <- "Marital Status at Baseline"
+label(BP1_inference_descip_data$Average_Med)   <- "Average Number of Concurrent Medications"
+label(BP1_inference_descip_data$Antipsychotics_Freq)   <- "Antipsychotics Use Frequency"
+label(BP1_inference_descip_data$Antidepressants_Freq)   <- "Antidepressants Use Frequency"
+label(BP1_inference_descip_data$Anxiolytics_Freq)   <- "Anxiolytics Use Frequency"
+label(BP1_inference_descip_data$Mood_Stabilizer_Freq)   <- "Mood Stabilizer Use Frequency"
+label(BP1_inference_descip_data$Antipsychotics_Freq_percent)   <- "Antipsychotics Use Frequency (%)"
+label(BP1_inference_descip_data$Antidepressants_Freq_percent)   <- "Antidepressants Use Frequency (%)"
+label(BP1_inference_descip_data$Anxiolytics_Freq_percent)   <- "Anxiolytics Use Frequency (%)"
+label(BP1_inference_descip_data$Mood_Stabilizer_Freq_percent)   <- "Mood Stabilizer Use Frequency (%)"
+label(BP1_inference_descip_data$be_alcohol)   <- "Alcohol Use Disorder"
+label(BP1_inference_descip_data$be_cannabis)   <- "Cannabis Use Disorder"
+label(BP1_inference_descip_data$be_cocaine)   <- "Cocaine Use Disorder"
+label(BP1_inference_descip_data$be_specificphobia)   <- "Specific Phobia"
+label(BP1_inference_descip_data$be_ptsd)   <- "PTSD"
+label(BP1_inference_descip_data$digs_head_injury)   <- "Head Injury"
+label(BP1_inference_descip_data$digs_migraine)   <- "Migraine"
+label(BP1_inference_descip_data$digs_overweight)   <- "Overweight"
+
+label(BP2_inference_descip_data$gender)   <- "Gender"
+label(BP2_inference_descip_data$measure_age)   <- "Age at Baseline"
+label(BP2_inference_descip_data$baseline_marital_status)   <- "Marital Status at Baseline"
+label(BP2_inference_descip_data$Average_Med)   <- "Average Number of Concurrent Medications"
+label(BP2_inference_descip_data$Antipsychotics_Freq)   <- "Antipsychotics Use Frequency"
+label(BP2_inference_descip_data$Antidepressants_Freq)   <- "Antidepressants Use Frequency"
+label(BP2_inference_descip_data$Anxiolytics_Freq)   <- "Anxiolytics Use Frequency"
+label(BP2_inference_descip_data$Mood_Stabilizer_Freq)   <- "Mood Stabilizer Use Frequency"
+label(BP2_inference_descip_data$Antipsychotics_Freq_percent)   <- "Antipsychotics Use Frequency (%)"
+label(BP2_inference_descip_data$Antidepressants_Freq_percent)   <- "Antidepressants Use Frequency (%)"
+label(BP2_inference_descip_data$Anxiolytics_Freq_percent)   <- "Anxiolytics Use Frequency (%)"
+label(BP2_inference_descip_data$Mood_Stabilizer_Freq_percent)   <- "Mood Stabilizer Use Frequency (%)"
+label(BP2_inference_descip_data$be_alcohol)   <- "Alcohol Use Disorder"
+label(BP2_inference_descip_data$be_cannabis)   <- "Cannabis Use Disorder"
+label(BP2_inference_descip_data$be_cocaine)   <- "Cocaine Use Disorder"
+label(BP2_inference_descip_data$be_specificphobia)   <- "Specific Phobia"
+label(BP2_inference_descip_data$be_ptsd)   <- "PTSD"
+label(BP2_inference_descip_data$digs_head_injury)   <- "Head Injury"
+label(BP2_inference_descip_data$digs_migraine)   <- "Migraine"
+label(BP2_inference_descip_data$digs_overweight)   <- "Overweight"
+```
+
+#### BP1 BP2 Control Summary Statistics
+```{r}
+BP1_distinct_temp <- BP1_PHQ_mergeData_distinct_temp[,c(-18,-23,-24,-25,-26,-36)]
+BP1_distinct_temp$Disease_Type <- "BP1"
+BP2_distinct_temp <- BP2_PHQ_mergeData_distinct_temp[,c(-18,-23,-24,-25,-26,-36)]
+BP2_distinct_temp$Disease_Type <- "BP2"
+Control_PHQ_mergeData_distinct_temp$Disease_Type <- "Control"
+mergeData_distinct_temp = rbind(BP1_distinct_temp, BP2_distinct_temp, Control_PHQ_mergeData_distinct_temp)
+
+mergeData_distinct_temp$be_specificphobia <- factor(mergeData_distinct_temp$be_specificphobia, levels = c("Yes", "No"))
+mergeData_distinct_temp$be_ptsd <- factor(mergeData_distinct_temp$be_ptsd, levels = c("Yes", "No"))
+mergeData_distinct_temp$digs_head_injury <- factor(mergeData_distinct_temp$digs_head_injury, levels = c("Yes", "No"))
+mergeData_distinct_temp$digs_migraine <- factor(mergeData_distinct_temp$digs_migraine, levels = c("Yes", "No"))
+mergeData_distinct_temp$digs_overweight <- factor(mergeData_distinct_temp$digs_overweight, levels = c("Yes", "No"))
+mergeData_distinct_temp$be_alcohol <- factor(mergeData_distinct_temp$be_alcohol, levels = c("Yes", "No"))
+mergeData_distinct_temp$be_cannabis <- factor(mergeData_distinct_temp$be_cannabis, levels = c("Yes", "No"))
+mergeData_distinct_temp$be_cocaine <- factor(mergeData_distinct_temp$be_cocaine, levels = c("Yes", "No"))
+label(mergeData_distinct_temp$gender)   <- "Gender"
+label(mergeData_distinct_temp$measure_age)   <- "Age at Baseline"
+label(mergeData_distinct_temp$baseline_marital_status)   <- "Marital Status at Baseline"
+label(mergeData_distinct_temp$Average_Med)   <- "Average Number of Concurrent Medications"
+label(mergeData_distinct_temp$Antipsychotics_Freq)   <- "Antipsychotics Use Frequency"
+label(mergeData_distinct_temp$Antidepressants_Freq)   <- "Antidepressants Use Frequency"
+label(mergeData_distinct_temp$Anxiolytics_Freq)   <- "Anxiolytics Use Frequency"
+label(mergeData_distinct_temp$Mood_Stabilizer_Freq)   <- "Mood Stabilizer Use Frequency"
+label(mergeData_distinct_temp$Antipsychotics_Freq_percent)   <- "Antipsychotics Use Frequency (%)"
+label(mergeData_distinct_temp$Antidepressants_Freq_percent)   <- "Antidepressants Use Frequency (%)"
+label(mergeData_distinct_temp$Anxiolytics_Freq_percent)   <- "Anxiolytics Use Frequency (%)"
+label(mergeData_distinct_temp$Mood_Stabilizer_Freq_percent)   <- "Mood Stabilizer Use Frequency (%)"
+label(mergeData_distinct_temp$be_alcohol)   <- "Alcohol Use Disorder"
+label(mergeData_distinct_temp$be_cannabis)   <- "Cannabis Use Disorder"
+label(mergeData_distinct_temp$be_cocaine)   <- "Cocaine Use Disorder"
+label(mergeData_distinct_temp$be_specificphobia)   <- "Specific Phobia"
+label(mergeData_distinct_temp$be_ptsd)   <- "PTSD"
+label(mergeData_distinct_temp$digs_head_injury)   <- "Head Injury"
+label(mergeData_distinct_temp$digs_migraine)   <- "Migraine"
+label(mergeData_distinct_temp$digs_overweight)   <- "Overweight"
+
+
+my.render.cont <- function(x) {
+    with(stats.apply.rounding(stats.default(x), digits=2), c("",
+        "Mean (SD)"=sprintf("%s (&plusmn; %s)", MEAN, SD)))
+}
+
+pvalue <- function(x, ...) {
+    # Flatten data and create grouping factor
+    y <- unlist(x)
+    g <- factor(rep(1:length(x), times=sapply(x, length)))
+
+    if (is.numeric(y)) {
+        # Check if any group has all zero values
+        if (any(tapply(y, g, function(x) all(x == 0)))) {
+            # If any group has all zero values, return P<.001
+            p <- NA
+            test_name <- "ANOVA"
+        } else {
+            # For numeric variables, perform ANOVA for multiple groups
+            test_result <- tryCatch(oneway.test(y ~ g), error = function(e) NA)
+            p <- test_result$p.value
+            test_name <- "ANOVA"
+        }
+    } else {
+        # For categorical variables, perform chi-squared test
+        table_data <- table(y, g)
+        test_result <- chisq.test(table(y, g))
+        p <- test_result$p.value
+        test_name <- "Chi-sq"
+    }
+    
+    # Format the P-value
+    if (is.na(p)) {
+        p_val <- "P<.001"
+    } else if (p < .001) {
+        p_val <- "P<.001"
+    } else if (p < .01) {
+        p_val <-  paste0("P=", format.pval(p, digits = 2, eps = .001))
+    } else {
+        p_val <- paste0("P=", format.pval(p, digits = 2, eps = .001))
+    }
+    
+    # Return the test name and formatted P-value
+    return(c("", sprintf("%s, %s", test_name, p_val)))
+}
+
+
+
+mergeData_distinct_temp$Disease_Type[mergeData_distinct_temp$Disease_Type == "Control"] <- "Healthy Control"
+  
+# Create the descriptive table and add the P-value column
+table1::table1(
+  ~ gender + measure_age + baseline_marital_status + Average_Med  + 
+    Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Mood_Stabilizer_Freq + 
+    be_alcohol + be_cannabis + be_cocaine + be_specificphobia + be_ptsd + digs_head_injury + 
+    digs_migraine + digs_overweight | Disease_Type, 
+  data = mergeData_distinct_temp, 
+  overall = FALSE, 
+  render.cont = my.render.cont, 
+  extra.col = list(`P-value` = pvalue)
+)
+```
+
+```{r}
+table1::table1(
+  ~ gender + measure_age + baseline_marital_status + Average_Med  + 
+    Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Mood_Stabilizer_Freq + 
+    be_alcohol + be_cannabis + be_cocaine + be_specificphobia + be_ptsd + digs_head_injury + 
+    digs_migraine + digs_overweight | Disease_Type, 
+  data = mergeData_distinct_temp[mergeData_distinct_temp$Disease_Type != "Healthy Control", ], 
+  overall = FALSE, 
+  render.cont = my.render.cont, 
+  extra.col = list(`P-value` = pvalue)
+)
+```
+
+#### BP1 LAMP Summary Statistics ####
+```{r}
+my.render.cont <- function(x) {
+    with(stats.apply.rounding(stats.default(x), digits=2), c("",
+        "Mean (SD)"=sprintf("%s (&plusmn; %s)", MEAN, SD)))
+}
+
+table1::table1(~ gender + measure_age + baseline_marital_status + Average_Med + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Mood_Stabilizer_Freq + be_alcohol + be_cannabis + be_cocaine + be_specificphobia + be_ptsd + digs_head_injury + digs_migraine + digs_overweight | Score_Type*New_Group, data = BP1_inference_descip_data, overall=F, render.continuous = my.render.cont)
+```
+
+#### BP2 LAMP Summary Statistics ####
+```{r}
+table1::table1(~ gender + measure_age + baseline_marital_status + Average_Med + Antipsychotics_Freq + Antidepressants_Freq + Anxiolytics_Freq + Mood_Stabilizer_Freq + be_alcohol + be_cannabis + be_cocaine + be_specificphobia + be_ptsd + digs_head_injury + digs_migraine + digs_overweight | Score_Type*New_Group, data = BP2_inference_descip_data, overall=F, render.continuous = my.render.cont)
+```
+
+
+#### BP1 BP2 PHQ LAMP Rregression Model ####
+```{r}
+BP1_logit_data = BP_PHQ_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 1 (296.70A)") %>% ungroup() %>% select(c("New_Group", "PHQ_intercept", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP1_logit_data = na.omit(BP1_logit_data)
+BP1_logit_model = glm(New_Group ~ . , family = binomial(link = "logit"), data = BP1_logit_data)
+
+# +  Mood_Stabilizer_Freq*Antidepressants_Freq + Antipsychotics_Freq*Antidepressants_Freq
+
+coefficients <- summary(BP1_logit_model)$coefficients
+conf_intervals <- confint(BP1_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+conditional_round <- function(x) {
+  ifelse(abs(x - 1) < 0.01, format(round(x, 5), nsmall = 5), format(round(x, 2), nsmall = 2))
+}
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP1_PHQ_model.csv", row.names = TRUE)
+
+
+BP2_logit_data = BP_PHQ_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)") %>% ungroup() %>% select(c("New_Group", "PHQ_intercept", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP2_logit_data = na.omit(BP2_logit_data)
+
+BP2_logit_model = glm(New_Group ~ . , family = binomial(link = "logit"), data = BP2_logit_data)
+# +  Mood_Stabilizer_Freq*Antidepressants_Freq + Antipsychotics_Freq*Antidepressants_Freq
+coefficients <- summary(BP2_logit_model)$coefficients
+conf_intervals <- confint(BP2_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP2_PHQ_model.csv", row.names = TRUE)
+```
+
+#### BP1 PHQ Tests for Medication Interactions ####
+```{r}
+# Fit the model with the first interaction term
+BP1_logit_model_interaction1 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP1_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP1_logit_model, BP1_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP1_logit_model_interaction2 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP1_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP1_logit_model, BP1_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP1_logit_model_interaction3 <- glm(New_Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP1_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP1_logit_model, BP1_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+#### BP2 PHQ Tests for Medication Interactions ####
+
+```{r}
+# Fit the model with the first interaction term
+BP2_logit_model_interaction1 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP2_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP2_logit_model, BP2_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP2_logit_model_interaction2 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP2_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP2_logit_model, BP2_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP2_logit_model_interaction3 <- glm(New_Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP2_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP2_logit_model, BP2_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+#### BP1 BP2 GAD LAMP Rregression Model ####
+```{r}
+BP1_logit_data = BP_GAD_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 1 (296.70A)") %>% ungroup() %>% select(c("New_Group", "GAD_intercept", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP1_logit_data = na.omit(BP1_logit_data)
+BP1_logit_model = glm(New_Group ~ . , family = binomial(link = "logit"), data = BP1_logit_data)
+
+coefficients <- summary(BP1_logit_model)$coefficients
+conf_intervals <- confint(BP1_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP1_GAD_model.csv", row.names = TRUE)
+
+
+BP2_logit_data = BP_GAD_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)") %>% ungroup() %>% select(c("New_Group", "GAD_intercept", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP2_logit_data = na.omit(BP2_logit_data)
+
+BP2_logit_model = glm(New_Group ~ . , family = binomial(link = "logit"), data = BP2_logit_data)
+coefficients <- summary(BP2_logit_model)$coefficients
+conf_intervals <- confint(BP2_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP2_GAD_model.csv", row.names = TRUE)
+```
+
+#### BP1 GAD Tests for Medication Interactions ####
+```{r}
+# Fit the model with the first interaction term
+BP1_logit_model_interaction1 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP1_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP1_logit_model, BP1_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP1_logit_model_interaction2 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP1_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP1_logit_model, BP1_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP1_logit_model_interaction3 <- glm(New_Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP1_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP1_logit_model, BP1_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+#### BP2 GAD Tests for Medication Interactions ####
+
+```{r}
+# Fit the model with the first interaction term
+BP2_logit_model_interaction1 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP2_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP2_logit_model, BP2_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP2_logit_model_interaction2 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP2_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP2_logit_model, BP2_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP2_logit_model_interaction3 <- glm(New_Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP2_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP2_logit_model, BP2_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+#### BP1 ASRM LAMP Rregression Model ####
+```{r}
+BP1_logit_data = BP_ASRM_mergeData_distinct_temp %>% filter(be_dsmiv == "Bipolar 1 (296.70A)") %>% ungroup() %>% select(c("New_Group", "ASRM_intercept", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP1_logit_data = na.omit(BP1_logit_data)
+BP1_logit_model = glm(New_Group ~ . , family = binomial(link = "logit"), data = BP1_logit_data)
+
+coefficients <- summary(BP1_logit_model)$coefficients
+conf_intervals <- confint(BP1_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP1_ASRM_model.csv", row.names = TRUE)
+```
+
+#### BP1 ASRM Tests for Medication Interactions ####
+```{r}
+# Fit the model with the first interaction term
+BP1_logit_model_interaction1 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP1_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP1_logit_model, BP1_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP1_logit_model_interaction2 <- glm(New_Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP1_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP1_logit_model, BP1_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP1_logit_model_interaction3 <- glm(New_Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP1_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP1_logit_model, BP1_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+#### BP1 BP2 Integrated LAMP Rregression Model ####
+```{r}
+BP1_logit_data = BP_final_dataset %>% filter(be_dsmiv == "Bipolar 1 (296.70A)") %>% ungroup() %>% select(c("Group", "baseline_mood_severity_category", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP1_logit_data = na.omit(BP1_logit_data)
+BP1_logit_model = glm(Group ~ . , family = binomial(link = "logit"), data = BP1_logit_data)
+
+coefficients <- summary(BP1_logit_model)$coefficients
+conf_intervals <- confint(BP1_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP1_Integrate_model.csv", row.names = TRUE)
+
+
+BP2_logit_data = BP_final_dataset %>% filter(be_dsmiv == "Bipolar 2 with Recurrent Depression (296.89R)") %>% ungroup() %>% select(c("Group", "baseline_mood_severity_category", "gender", "measure_age", "baseline_marital_status", "Average_Med", "Antipsychotics_Freq", "Antidepressants_Freq", 
+                  "Anxiolytics_Freq", "Mood_Stabilizer_Freq", "be_alcohol", "be_cannabis", 
+                  "be_cocaine", "be_specificphobia", "be_ptsd", "digs_head_injury", 
+                 "digs_migraine", "digs_overweight"))
+BP2_logit_data = na.omit(BP2_logit_data)
+BP2_logit_model = glm(Group ~ . , family = binomial(link = "logit"), data = BP2_logit_data)
+
+coefficients <- summary(BP2_logit_model)$coefficients
+conf_intervals <- confint(BP2_logit_model)
+odds_ratios <- exp(coefficients[, 1])
+conf_intervals_odds_ratios <- exp(conf_intervals)
+results <- data.frame(
+  `Odds Ratio` = odds_ratios,
+  `LB.CI` = conf_intervals_odds_ratios[, 1],
+  `UB.CI` = conf_intervals_odds_ratios[, 2],
+  `P-Value` = coefficients[, 4]
+)
+print(results)
+results <- as.data.frame(lapply(results, conditional_round))
+write.csv(results, file = "BP2_Integrate_model.csv", row.names = TRUE)
+```
+
+
+#### BP1 Integration Tests for Medication Interactions ####
+```{r}
+# Fit the model with the first interaction term
+BP1_logit_model_interaction1 <- glm(Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP1_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP1_logit_model, BP1_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP1_logit_model_interaction2 <- glm(Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP1_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP1_logit_model, BP1_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP1_logit_model_interaction3 <- glm(Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP1_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP1_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP1_logit_model, BP1_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+#### BP2 Integration Tests for Medication Interactions ####
+```{r}
+# Fit the model with the first interaction term
+BP2_logit_model_interaction1 <- glm(Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antidepressants_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction1 <- summary(BP2_logit_model_interaction1)$coefficients
+print(coefficients_interaction1)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result1 <- anova(BP2_logit_model, BP2_logit_model_interaction1, test = "LRT")
+print(lrt_result1)
+
+# Fit the model with the second interaction term
+BP2_logit_model_interaction2 <- glm(Group ~ . + 
+                                     Mood_Stabilizer_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction2 <- summary(BP2_logit_model_interaction2)$coefficients
+print(coefficients_interaction2)
+
+# Perform the Likelihood Ratio Test (LRT)
+lrt_result2 <- anova(BP2_logit_model, BP2_logit_model_interaction2, test = "LRT")
+print(lrt_result2)
+
+
+
+# Fit the model with the third interaction term
+BP2_logit_model_interaction3 <- glm(Group ~ . + 
+                                     Antidepressants_Freq * Antipsychotics_Freq, 
+                                     family = binomial(link = "logit"), data = BP2_logit_data)
+
+# Extract and interpret coefficients
+coefficients_interaction3 <- summary(BP2_logit_model_interaction3)$coefficients
+print(coefficients_interaction3)
+
+lrt_result3 <- anova(BP2_logit_model, BP2_logit_model_interaction3, test = "LRT")
+print(lrt_result3)
+```
+
+
+#### BP1 BP2 Inference Results ####
+```{r, warning=FALSE, message=FALSE}
+# Read the CSV file with specified columns as character strings
+BP1_Inference_results <- read.csv("BP1_Inference_results.csv",
+                                  colClasses = c("Odds.Ratio" = "character", 
+                                                 "LB.CI" = "character", 
+                                                 "UB.CI" = "character", 
+                                                 "P.Value" = "character"))
+
+fixed_order <- rev(c(
+  "Baseline Score", "Gender:Male", "Age at Baseline",
+  "Marital Status at Baseline:Married", "Marital Status at Baseline:Never Married",
+  "Average Number of Concurrent Medications",
+  "Antipsychotics Use Frequency", "Antidepressants Use Frequency", "Anxiolytics Use Frequency", "Mood Stabilizer Use Frequency", "Antidepressants:Mood Stabilizer", "Antidepressants:Antipsychotics",
+  "Alcohol Use Disorder:Yes", "Cannabis Use Disorder:Yes",
+  "Cocaine Use Disorder:Yes", "Specific Phobia:Yes", "PTSD:Yes",
+  "Head Injury:Yes", "Migraine:Yes", "Overweight:Yes"
+))
+
+BP1_Inference_results$Score_Type <- factor(BP1_Inference_results$Score_Type, levels = c("PHQ", "GAD", "ASRM", "Integrated"))
+levels(BP1_Inference_results$Score_Type)[levels(BP1_Inference_results$Score_Type) == "PHQ"] <- "PHQ-9"
+levels(BP1_Inference_results$Score_Type)[levels(BP1_Inference_results$Score_Type) == "GAD"] <- "GAD-7"
+
+plot_forest_all <- function(data) {
+  # Ensure the order of 'Variable' based on the fixed_order vector
+  data$Variable <- factor(data$Variable, levels = fixed_order)
+
+  # Convert P.Value to numeric where possible and mark "<0.001" as a very small value
+  data$P.Value.numeric <- as.numeric(data$P.Value)
+  data$P.Value.numeric[is.na(data$P.Value.numeric) & data$P.Value == "<0.001"] <- 0.001
+
+  # Create a new column to identify if P-value is smaller than 0.05
+  data$Significance <- ifelse(data$P.Value.numeric < 0.05, "P-value < 0.05", "P-value > 0.05")
+
+  # Create forest plot for all score types together
+  p <- ggplot(data, aes(x = as.numeric(Odds.Ratio), xmin = as.numeric(LB.CI), xmax = as.numeric(UB.CI), y = Variable)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+    geom_point(aes(color = Significance), size = 2) +
+    geom_errorbarh(aes(xmin = pmax(as.numeric(LB.CI), 0), xmax = pmin(as.numeric(UB.CI), 5), color = Significance), height = 0.2) +
+    geom_text(aes(x = 1.5, label = paste0(Odds.Ratio, " (", LB.CI, "-", UB.CI, ", p", 
+                                          ifelse(P.Value == "<0.001", "<0.001", paste0("=", P.Value)), ")")), 
+              hjust = 0, nudge_y = 0.2, color = "black", size = 3) +
+    scale_color_manual(values = c("P-value > 0.05" = "blue", "P-value < 0.05" = "red"),
+                       name = "Significance") +  # Custom labels for the legend
+    facet_grid(. ~ Score_Type, scales = "free", space = "free") +
+    labs(x = "Odds Ratio", y = "") +
+    xlim(0, 5) +
+    theme_minimal() +
+    theme(strip.text.x = element_text(size = 12, face = "bold"), panel.spacing = unit(0, "lines"))
+
+  # Add an annotation for error bars that exceed 5
+  if (any(as.numeric(data$UB.CI) > 5)) {
+    p <- p + geom_text(data = data %>% filter(as.numeric(data$UB.CI) > 5),
+                       aes(x = 5, label = ">", y = Variable, hjust = -0.3),
+                       color = "blue", size = 4)
+  }
+
+  return(p)
+}
+
+plot_forest_all <- function(data) {
+  # Ensure the order of 'Variable' based on the fixed_order vector
+  data$Variable <- factor(data$Variable, levels = fixed_order)
+
+  # Convert P.Value to numeric where possible and mark "<0.001" as a very small value
+  data$P.Value.numeric <- as.numeric(data$P.Value)
+  data$P.Value.numeric[is.na(data$P.Value.numeric) & data$P.Value == "<0.001"] <- 0.001
+
+  # Create a new column to identify if P-value is smaller than 0.05
+  data$Significance <- ifelse(data$P.Value.numeric < 0.05, "P-value < 0.05", "P-value > 0.05")
+
+  # Create forest plot for all score types together
+  p <- ggplot(data, aes(x = as.numeric(Odds.Ratio), xmin = as.numeric(LB.CI), xmax = as.numeric(UB.CI), y = Variable)) +
+    geom_vline(xintercept = 1, linetype = "dashed", color = "red") +
+    geom_point(aes(color = Significance), size = 2) +
+    geom_errorbarh(aes(xmin = pmax(as.numeric(LB.CI), 0), xmax = pmin(as.numeric(UB.CI), 5), color = Significance), height = 0.2) +
+    geom_text(aes(x = 1.5, label = paste0(Odds.Ratio, " (", LB.CI, "-", UB.CI, ", p", 
+                                          ifelse(P.Value == "<0.001", "<0.001", paste0("=", P.Value)), ")")), 
+              hjust = 0, nudge_y = 0.2, color = "black", size = 3) +
+    scale_color_manual(values = c("P-value > 0.05" = "blue", "P-value < 0.05" = "red"),
+                       name = "Significance") +  # Custom labels for the legend
+    facet_grid(. ~ Score_Type, scales = "free", space = "free") +
+    labs(x = "Odds Ratio", y = "") +
+    xlim(0, 5) +
+    theme_minimal() +
+    theme(strip.text.x = element_text(size = 12, face = "bold"), panel.spacing = unit(0, "lines"))
+
+  # Add an annotation for error bars that exceed 5 with conditional coloring
+  if (any(as.numeric(data$UB.CI) > 5)) {
+    p <- p + geom_text(data = data %>% filter(as.numeric(data$UB.CI) > 5),
+                       aes(x = 5, label = ">", color = Significance, y = Variable, hjust = -0.3),
+                       size = 4)
+  }
+
+  return(p)
+}
+
+# Generate and plot the combined plot for all score types
+plot_forest_all(BP1_Inference_results)
+
+BP2_Inference_results <- read.csv("BP2_Inference_results.csv",
+                                  colClasses = c("Odds.Ratio" = "character", 
+                                                 "LB.CI" = "character", 
+                                                 "UB.CI" = "character", 
+                                                 "P.Value" = "character"))
+
+fixed_order <- rev(c(
+  "Baseline Score", "Gender:Male", "Age at Baseline",
+  "Marital Status at Baseline:Married", "Marital Status at Baseline:Never Married",
+  "Average Number of Concurrent Medications",
+  "Antipsychotics Use Frequency", "Antidepressants Use Frequency", "Anxiolytics Use Frequency", "Mood Stabilizer Use Frequency", "Antidepressants:Mood Stabilizer", "Antidepressants:Antipsychotics",
+  "Alcohol Use Disorder:Yes", "Cannabis Use Disorder:Yes",
+  "Cocaine Use Disorder:Yes", "Specific Phobia:Yes", "PTSD:Yes",
+  "Head Injury:Yes", "Migraine:Yes", "Overweight:Yes"
+))
+
+
+BP2_Inference_results$Score_Type <- factor(BP2_Inference_results$Score_Type, levels = c("PHQ", "GAD", "Integrated"))
+levels(BP2_Inference_results$Score_Type)[levels(BP2_Inference_results$Score_Type) == "PHQ"] <- "PHQ-9"
+levels(BP2_Inference_results$Score_Type)[levels(BP2_Inference_results$Score_Type) == "GAD"] <- "GAD-7"
+
+# Generate and plot the combined plot for all score types
+plot_forest_all(BP2_Inference_results)
+```
+
